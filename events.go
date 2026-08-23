@@ -239,9 +239,16 @@ func (m *EventMonitor) pollOutputs(ctx context.Context, sessions map[string]*Ses
 	m.mu.Unlock()
 
 	for _, sid := range sessionIDs {
+		// A watched session missing from the last snapshot closed between
+		// refreshes; the session poll will emit session_closed and unwatch it.
+		s := sessions[sid]
+		if s == nil {
+			continue
+		}
+
 		var data string
 		var err error
-		if s := sessions[sid]; s != nil && s.Type == "meterpreter" {
+		if s.Type == "meterpreter" {
 			data, err = NewMeterpreterSession(m.rpc, sid).Read(ctx)
 		} else {
 			data, err = NewShellSession(m.rpc, sid).Read(ctx)

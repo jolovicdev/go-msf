@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"strconv"
 	"sync"
 	"testing"
@@ -250,5 +251,72 @@ func TestClientWithToken_NoReauthWithoutPassword(t *testing.T) {
 	defer server.mu.Unlock()
 	if server.logins != 0 {
 		t.Fatalf("expected no login attempts without stored password, got %d", server.logins)
+	}
+}
+
+func TestClientCall_RejectsOversizedMap(t *testing.T) {
+	// map32 header claiming ~4 billion entries followed by no data.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write([]byte{0xdf, 0xff, 0xff, 0xff, 0xff}); err != nil {
+			t.Errorf("write failed: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	_, err = client.Call(context.Background(), CoreVersion)
+	if err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("expected map size limit error, got %v", err)
+	}
+}
+
+func TestClientCall_RejectsDuplicateNormalizedKeys(t *testing.T) {
+	payload, err := msgpack.Marshal(map[interface{}]interface{}{
+		1:   "integer one",
+		"1": "string one",
+	})
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write(payload); err != nil {
+			t.Errorf("write failed: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	_, err = client.Call(context.Background(), CoreVersion)
+	if err == nil || !strings.Contains(err.Error(), "duplicate map key") {
+		t.Fatalf("expected duplicate key error, got %v", err)
 	}
 }

@@ -104,7 +104,7 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 		}
 	}
 
-	if err := c.login(c.username, password); err != nil {
+	if err := c.login(context.Background(), c.username, password); err != nil {
 		return nil, err
 	}
 
@@ -219,8 +219,8 @@ func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	return result, nil
 }
 
-func (c *Client) login(username, password string) error {
-	result, err := c.Call(context.Background(), AuthLogin, username, password)
+func (c *Client) login(ctx context.Context, username, password string) error {
+	result, err := c.Call(ctx, AuthLogin, username, password)
 	if err != nil {
 		return err
 	}
@@ -287,7 +287,7 @@ func (c *Client) reloginIfStale(ctx context.Context, failedToken string) error {
 		return nil
 	}
 
-	return c.login(c.username, c.password)
+	return c.login(ctx, c.username, c.password)
 }
 
 func isInvalidTokenError(err error) bool {
@@ -300,9 +300,15 @@ func isInvalidTokenError(err error) bool {
 	return message
 }
 
+// maxDecodedMapSize bounds the pre-allocation performed for a decoded map;
+// the length prefix on the wire is untrusted and msfrpcd responses stay far
+// below this.
+const maxDecodedMapSize = 1 << 20
+
 // stringKeyedMap decodes a msgpack map into map[string]interface{} regardless
 // of the wire key type: binary and string keys map directly, other key types
-// (msfrpcd uses integer indices) are formatted.
+// (msfrpcd uses integer indices) are formatted. Normalization collisions are
+// rejected instead of silently overwriting the earlier value.
 func stringKeyedMap(d *msgpack.Decoder) (interface{}, error) {
 	n, err := d.DecodeMapLen()
 	if err != nil {
@@ -310,6 +316,9 @@ func stringKeyedMap(d *msgpack.Decoder) (interface{}, error) {
 	}
 	if n == -1 {
 		return nil, nil
+	}
+	if n > maxDecodedMapSize {
+		return nil, fmt.Errorf("msgpack map length %d exceeds limit %d", n, maxDecodedMapSize)
 	}
 
 	m := make(map[string]interface{}, n)
@@ -322,7 +331,11 @@ func stringKeyedMap(d *msgpack.Decoder) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		m[interfaceKeyToString(key)] = value
+		normalized := interfaceKeyToString(key)
+		if _, exists := m[normalized]; exists {
+			return nil, fmt.Errorf("duplicate map key after normalization: %q", normalized)
+		}
+		m[normalized] = value
 	}
 
 	return m, nil
@@ -392,13 +405,14 @@ func decodeList[T any](result interface{}, key string) ([]*T, error) {
 		return nil, fmt.Errorf("%w: expected %s list", ErrUnexpectedResponse, key)
 	}
 
-	values := make([]*T, 0, len(raw))
-	for i, item := range raw {
-		var value T
-		if err := decodeResult(item, &value); err != nil {
-			return nil, fmt.Errorf("%w: invalid %s[%d]", ErrUnexpectedResponse, key, i)
-		}
-		values = append(values, &value)
+	encoded, err := msgpack.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid %s list: %v", ErrUnexpectedResponse, key, err)
+	}
+
+	var values []*T
+	if err := msgpack.Unmarshal(encoded, &values); err != nil {
+		return nil, fmt.Errorf("%w: invalid %s list: %v", ErrUnexpectedResponse, key, err)
 	}
 
 	return values, nil
