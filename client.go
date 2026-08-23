@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -148,11 +149,12 @@ func (c *Client) url() string {
 
 // Call performs an RPC round trip. If the server rejects the token and the
 // client was constructed with NewClient, it re-authenticates once and retries.
+// Logout is exempt: a rejected token there only ends the local session.
 func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
 	failedToken := c.Token()
 
 	result, err := c.call(ctx, method, args...)
-	if err == nil || method == AuthLogin || c.password == "" || !isInvalidTokenError(err) {
+	if err == nil || method == AuthLogin || method == AuthLogout || !c.hasPassword() || !isInvalidTokenError(err) {
 		return result, err
 	}
 
@@ -201,8 +203,11 @@ func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interfac
 
 	// msfrpcd encodes strings as binary and some maps (module.info targets)
 	// with integer keys, so decode maps with tolerant keys and normalize
-	// afterwards.
-	decoder := msgpack.NewDecoder(resp.Body)
+	// afterwards. The decoder trusts the server the same way the caller does:
+	// it is not hardened against a hostile msfrpcd, but map pre-allocation
+	// and the total response size are bounded so malformed lengths cannot
+	// drive the allocation cost far past the payload.
+	decoder := msgpack.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes))
 	decoder.SetMapDecoder(stringKeyedMap)
 
 	var result interface{}
@@ -255,16 +260,25 @@ func (c *Client) Logout(ctx context.Context) error {
 		return nil
 	}
 
-	_, err := c.Call(ctx, AuthLogout, token)
-	if err != nil {
+	// A stale token has nothing to end server-side; treat it as logged out
+	// instead of re-authenticating and killing the fresh token.
+	_, err := c.call(ctx, AuthLogout, token)
+	if err != nil && !isInvalidTokenError(err) {
 		return err
 	}
 
 	c.tokenMu.Lock()
 	c.token = ""
+	c.password = ""
 	c.tokenMu.Unlock()
 
 	return nil
+}
+
+func (c *Client) hasPassword() bool {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.password != ""
 }
 
 func (c *Client) Token() string {
@@ -287,7 +301,11 @@ func (c *Client) reloginIfStale(ctx context.Context, failedToken string) error {
 		return nil
 	}
 
-	return c.login(ctx, c.username, c.password)
+	c.tokenMu.RLock()
+	password := c.password
+	c.tokenMu.RUnlock()
+
+	return c.login(ctx, c.username, password)
 }
 
 func isInvalidTokenError(err error) bool {
@@ -304,6 +322,11 @@ func isInvalidTokenError(err error) bool {
 // the length prefix on the wire is untrusted and msfrpcd responses stay far
 // below this.
 const maxDecodedMapSize = 1 << 20
+
+// maxResponseBytes bounds how much of a response body is decoded at all.
+// Real msfrpcd responses (module listings, console output, loot) stay far
+// below this; anything larger is treated as malformed.
+const maxResponseBytes = 256 << 20
 
 // stringKeyedMap decodes a msgpack map into map[string]interface{} regardless
 // of the wire key type: binary and string keys map directly, other key types

@@ -97,8 +97,8 @@ type Job struct {
 }
 
 type ModuleReference struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+	Type  string `msgpack:"type" json:"type"`
+	Value string `msgpack:"value" json:"value"`
 }
 
 type MsfModuleInfo struct {

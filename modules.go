@@ -129,6 +129,12 @@ func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name strin
 		}
 	}
 
+	// rpc_info always reports name and rank for a valid module; anything
+	// else means the response is malformed.
+	if info.Name == "" || info.Rank == "" {
+		return nil, fmt.Errorf("%w: missing module name or rank", ErrUnexpectedResponse)
+	}
+
 	return info, nil
 }
 

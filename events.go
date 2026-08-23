@@ -38,6 +38,11 @@ type Event struct {
 // the monitor starts are reported as session_opened, so a late-attaching UI
 // receives the full current state.
 //
+// Event delivery applies backpressure: when the consumer falls behind and
+// the channel is full, polling pauses until the consumer drains it, so
+// events are never dropped but a slow consumer slows the monitor down with
+// it. Size the buffer with WithEventBuffer if consumers may stall.
+//
 // Watching a session or console transfers ownership of its output to the
 // monitor: session.shell_read / session.meterpreter_read / console.read drain
 // the server-side buffer, so a watched stream must only be read through the
