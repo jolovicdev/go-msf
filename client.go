@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,8 +20,10 @@ type Client struct {
 	uri                 string
 	ssl                 bool
 	username            string
+	password            string
 	token               string
 	tokenMu             sync.RWMutex
+	reauthMu            sync.Mutex
 	client              *http.Client
 	consolePollInterval time.Duration
 	sessionPollInterval time.Duration
@@ -101,9 +105,11 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 		}
 	}
 
-	if err := c.login(c.username, password); err != nil {
+	if err := c.login(context.Background(), c.username, password); err != nil {
 		return nil, err
 	}
+
+	c.password = password
 
 	return c, nil
 }
@@ -141,7 +147,25 @@ func (c *Client) url() string {
 	return fmt.Sprintf("%s://%s:%d%s", scheme, c.host, c.port, c.uri)
 }
 
+// Call performs an RPC round trip. If the server rejects the token and the
+// client was constructed with NewClient, it re-authenticates once and retries.
+// Logout is exempt: a rejected token there only ends the local session.
 func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+	failedToken := c.Token()
+
+	result, err := c.call(ctx, method, args...)
+	if err == nil || method == AuthLogin || method == AuthLogout || !c.hasPassword() || !isInvalidTokenError(err) {
+		return result, err
+	}
+
+	if err := c.reloginIfStale(ctx, failedToken); err != nil {
+		return nil, err
+	}
+
+	return c.call(ctx, method, args...)
+}
+
+func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
 	c.tokenMu.RLock()
 	token := c.token
 	c.tokenMu.RUnlock()
@@ -177,8 +201,17 @@ func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	}
 	defer resp.Body.Close()
 
+	// msfrpcd encodes strings as binary and some maps (module.info targets)
+	// with integer keys, so decode maps with tolerant keys and normalize
+	// afterwards. The decoder trusts the server the same way the caller does:
+	// it is not hardened against a hostile msfrpcd, but map pre-allocation
+	// and the total response size are bounded so malformed lengths cannot
+	// drive the allocation cost far past the payload.
+	decoder := msgpack.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes))
+	decoder.SetMapDecoder(stringKeyedMap)
+
 	var result interface{}
-	if err := msgpack.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decoder.Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
@@ -191,8 +224,8 @@ func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	return result, nil
 }
 
-func (c *Client) login(username, password string) error {
-	result, err := c.Call(context.Background(), AuthLogin, username, password)
+func (c *Client) login(ctx context.Context, username, password string) error {
+	result, err := c.Call(ctx, AuthLogin, username, password)
 	if err != nil {
 		return err
 	}
@@ -227,16 +260,25 @@ func (c *Client) Logout(ctx context.Context) error {
 		return nil
 	}
 
-	_, err := c.Call(ctx, AuthLogout, token)
-	if err != nil {
+	// A stale token has nothing to end server-side; treat it as logged out
+	// instead of re-authenticating and killing the fresh token.
+	_, err := c.call(ctx, AuthLogout, token)
+	if err != nil && !isInvalidTokenError(err) {
 		return err
 	}
 
 	c.tokenMu.Lock()
 	c.token = ""
+	c.password = ""
 	c.tokenMu.Unlock()
 
 	return nil
+}
+
+func (c *Client) hasPassword() bool {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.password != ""
 }
 
 func (c *Client) Token() string {
@@ -249,6 +291,88 @@ func (c *Client) IsAuthenticated() bool {
 	c.tokenMu.RLock()
 	defer c.tokenMu.RUnlock()
 	return c.token != ""
+}
+
+func (c *Client) reloginIfStale(ctx context.Context, failedToken string) error {
+	c.reauthMu.Lock()
+	defer c.reauthMu.Unlock()
+
+	if c.Token() != failedToken {
+		return nil
+	}
+
+	c.tokenMu.RLock()
+	password := c.password
+	c.tokenMu.RUnlock()
+
+	return c.login(ctx, c.username, password)
+}
+
+func isInvalidTokenError(err error) bool {
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	message := strings.EqualFold(rpcErr.Message, "Invalid Authentication Token") ||
+		strings.EqualFold(rpcErr.Message, "Invalid Token")
+	return message
+}
+
+// maxDecodedMapSize bounds the pre-allocation performed for a decoded map;
+// the length prefix on the wire is untrusted and msfrpcd responses stay far
+// below this.
+const maxDecodedMapSize = 1 << 20
+
+// maxResponseBytes bounds how much of a response body is decoded at all.
+// Real msfrpcd responses (module listings, console output, loot) stay far
+// below this; anything larger is treated as malformed.
+const maxResponseBytes = 256 << 20
+
+// stringKeyedMap decodes a msgpack map into map[string]interface{} regardless
+// of the wire key type: binary and string keys map directly, other key types
+// (msfrpcd uses integer indices) are formatted. Normalization collisions are
+// rejected instead of silently overwriting the earlier value.
+func stringKeyedMap(d *msgpack.Decoder) (interface{}, error) {
+	n, err := d.DecodeMapLen()
+	if err != nil {
+		return nil, err
+	}
+	if n == -1 {
+		return nil, nil
+	}
+	if n > maxDecodedMapSize {
+		return nil, fmt.Errorf("msgpack map length %d exceeds limit %d", n, maxDecodedMapSize)
+	}
+
+	m := make(map[string]interface{}, n)
+	for i := 0; i < n; i++ {
+		key, err := d.DecodeInterface()
+		if err != nil {
+			return nil, err
+		}
+		value, err := d.DecodeInterface()
+		if err != nil {
+			return nil, err
+		}
+		normalized := interfaceKeyToString(key)
+		if _, exists := m[normalized]; exists {
+			return nil, fmt.Errorf("duplicate map key after normalization: %q", normalized)
+		}
+		m[normalized] = value
+	}
+
+	return m, nil
+}
+
+func interfaceKeyToString(key interface{}) string {
+	switch k := key.(type) {
+	case string:
+		return k
+	case []byte:
+		return string(k)
+	default:
+		return fmt.Sprintf("%v", k)
+	}
 }
 
 func convertBytesToString(v interface{}) interface{} {
@@ -293,6 +417,30 @@ func decodeResult(data interface{}, target interface{}) error {
 	return msgpack.Unmarshal(encoded, target)
 }
 
+func decodeList[T any](result interface{}, key string) ([]*T, error) {
+	data, err := responseMap(result)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, ok := data[key].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("%w: expected %s list", ErrUnexpectedResponse, key)
+	}
+
+	encoded, err := msgpack.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid %s list: %v", ErrUnexpectedResponse, key, err)
+	}
+
+	var values []*T
+	if err := msgpack.Unmarshal(encoded, &values); err != nil {
+		return nil, fmt.Errorf("%w: invalid %s list: %v", ErrUnexpectedResponse, key, err)
+	}
+
+	return values, nil
+}
+
 func responseMap(result interface{}) (map[string]interface{}, error) {
 	m, ok := result.(map[string]interface{})
 	if !ok {
@@ -330,6 +478,11 @@ func responseString(data map[string]interface{}, key string) (string, error) {
 		return "", fmt.Errorf("%w: expected %s string", ErrUnexpectedResponse, key)
 	}
 	return value, nil
+}
+
+func optionalString(data map[string]interface{}, key string) string {
+	value, _ := data[key].(string)
+	return value
 }
 
 func responseRPCError(result interface{}) (*RPCError, bool) {

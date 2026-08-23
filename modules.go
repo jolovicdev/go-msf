@@ -3,6 +3,8 @@ package gomsf
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 )
 
 type ModuleManager struct {
@@ -54,6 +56,111 @@ func (m *ModuleManager) Use(ctx context.Context, modType ModuleType, name string
 	return NewModuleWithContext(ctx, m.rpc, modType, name)
 }
 
+func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name string) (*MsfModuleInfo, error) {
+	result, err := m.rpc.Call(ctx, ModuleInfo, string(modType), name)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := responseMap(result)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &MsfModuleInfo{
+		Name:        optionalString(data, "name"),
+		Description: optionalString(data, "description"),
+		License:     optionalString(data, "license"),
+		FilePath:    optionalString(data, "filepath"),
+		Version:     optionalString(data, "version"),
+		Rank:        optionalString(data, "rank"),
+	}
+
+	if rawAuthors, ok := data["authors"].([]interface{}); ok {
+		info.Authors = make([]string, 0, len(rawAuthors))
+		for i, a := range rawAuthors {
+			author, ok := a.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: authors[%d] must be a string", ErrUnexpectedResponse, i)
+			}
+			info.Authors = append(info.Authors, author)
+		}
+	}
+
+	// msfrpcd reports targets inside module.info, keyed by integer index.
+	if rawTargets, ok := data["targets"].(map[string]interface{}); ok {
+		indices := make([]int, 0, len(rawTargets))
+		byIndex := make(map[int]string, len(rawTargets))
+		for key, rawName := range rawTargets {
+			index, err := strconv.Atoi(key)
+			if err != nil {
+				return nil, fmt.Errorf("%w: target key %q must be an index", ErrUnexpectedResponse, key)
+			}
+			name, ok := rawName.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: target %d must be a string", ErrUnexpectedResponse, index)
+			}
+			indices = append(indices, index)
+			byIndex[index] = name
+		}
+		sort.Ints(indices)
+		info.Targets = make([]string, 0, len(indices))
+		for _, index := range indices {
+			info.Targets = append(info.Targets, byIndex[index])
+		}
+	}
+
+	if rawRefs, ok := data["references"].([]interface{}); ok {
+		info.References = make([]ModuleReference, 0, len(rawRefs))
+		for i, r := range rawRefs {
+			pair, ok := r.([]interface{})
+			if !ok || len(pair) < 2 {
+				return nil, fmt.Errorf("%w: references[%d] must be a pair", ErrUnexpectedResponse, i)
+			}
+			refType, ok := pair[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: references[%d] type must be a string", ErrUnexpectedResponse, i)
+			}
+			refValue, ok := pair[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: references[%d] value must be a string", ErrUnexpectedResponse, i)
+			}
+			info.References = append(info.References, ModuleReference{Type: refType, Value: refValue})
+		}
+	}
+
+	// rpc_info always reports name and rank for a valid module; anything
+	// else means the response is malformed.
+	if info.Name == "" || info.Rank == "" {
+		return nil, fmt.Errorf("%w: missing module name or rank", ErrUnexpectedResponse)
+	}
+
+	return info, nil
+}
+
+// CompatiblePayloads returns the payloads compatible with an exploit.
+// The RPC takes the full module name only; the type is implied.
+func (m *ModuleManager) CompatiblePayloads(ctx context.Context, name string) ([]string, error) {
+	result, err := m.rpc.Call(ctx, ModuleCompatiblePayloads, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return responseStringSlice(result, "payloads")
+}
+
+// CompatibleSessions returns the sessions an exploit, auxiliary or post
+// module can run against. The RPC infers the module type from the name
+// prefix, so name must be the full module path.
+func (m *ModuleManager) CompatibleSessions(ctx context.Context, name string) ([]string, error) {
+	result, err := m.rpc.Call(ctx, ModuleCompatibleSessions, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return responseStringSlice(result, "sessions")
+}
+
 func (m *ModuleManager) Execute(ctx context.Context, modType ModuleType, name string, options map[string]interface{}) (*ModuleExecuteResult, error) {
 	result, err := m.rpc.Call(ctx, ModuleExecute, string(modType), name, options)
 	if err != nil {
@@ -72,7 +179,7 @@ type Module struct {
 	rpc        RPCCaller
 	ModuleType ModuleType
 	Name       string
-	info       map[string]interface{}
+	Info       *MsfModuleInfo
 	options    map[string]*MsfModuleOption
 	runOptions map[string]interface{}
 }
@@ -89,26 +196,32 @@ func NewModuleWithContext(ctx context.Context, rpc RPCCaller, modType ModuleType
 		runOptions: make(map[string]interface{}),
 	}
 
-	info, err := rpc.Call(ctx, ModuleOptions, string(modType), name)
+	rawOptions, err := rpc.Call(ctx, ModuleOptions, string(modType), name)
 	if err != nil {
 		return nil, err
 	}
 
-	mod.info, err = responseMap(info)
+	optionsMap, err := responseMap(rawOptions)
 	if err != nil {
 		return nil, err
 	}
-	if err := mod.parseOptions(); err != nil {
+	if err := mod.parseOptions(optionsMap); err != nil {
 		return nil, err
 	}
+
+	info, err := NewModuleManager(rpc).Info(ctx, modType, name)
+	if err != nil {
+		return nil, err
+	}
+	mod.Info = info
 
 	return mod, nil
 }
 
-func (m *Module) parseOptions() error {
+func (m *Module) parseOptions(rawOptions map[string]interface{}) error {
 	m.options = make(map[string]*MsfModuleOption)
 
-	for key, val := range m.info {
+	for key, val := range rawOptions {
 		optMap, ok := val.(map[string]interface{})
 		if !ok {
 			return fmt.Errorf("%w: option %s must be a map", ErrUnexpectedResponse, key)
@@ -254,6 +367,24 @@ func (m *Module) RunOptions() map[string]interface{} {
 
 func (m *Module) Execute(ctx context.Context) (*ModuleExecuteResult, error) {
 	return NewModuleManager(m.rpc).Execute(ctx, m.ModuleType, m.Name, m.runOptions)
+}
+
+// Targets returns the exploit's target list, captured when the module was
+// loaded. There is no module.targets RPC; msfrpcd reports targets inside
+// module.info keyed by integer index.
+func (m *Module) Targets() []string {
+	if m.Info == nil {
+		return nil
+	}
+	return m.Info.Targets
+}
+
+func (m *Module) CompatiblePayloads(ctx context.Context) ([]string, error) {
+	return NewModuleManager(m.rpc).CompatiblePayloads(ctx, m.Name)
+}
+
+func (m *Module) CompatibleSessions(ctx context.Context) ([]string, error) {
+	return NewModuleManager(m.rpc).CompatibleSessions(ctx, m.Name)
 }
 
 func (m *Module) ExecuteWithPayload(ctx context.Context, payload *Module) (*ModuleExecuteResult, error) {

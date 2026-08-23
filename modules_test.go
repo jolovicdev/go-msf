@@ -2,6 +2,7 @@ package gomsf
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -163,5 +164,120 @@ func TestModule_SetOption_Invalid(t *testing.T) {
 	err = mod.SetOption("INVALID_OPTION", "value")
 	if err == nil {
 		t.Error("Expected error for invalid option")
+	}
+}
+
+func TestModuleManager_Info(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{
+				"name":        "MS08-067 Microsoft Server Service Relative Path Stack Corruption",
+				"description": "This module exploits a parsing flaw...",
+				"rank":        "great",
+				"authors":     []interface{}{"hdm", "skape"},
+				"targets": map[string]interface{}{
+					"0": "Automatic",
+					"2": "Windows 2003 Universal",
+					"1": "Windows 2000 Universal",
+				},
+				"references": []interface{}{
+					[]interface{}{"CVE", "2008-4250"},
+					[]interface{}{"MSB", "MS08-067"},
+				},
+			}, nil
+		},
+	}
+
+	info, err := NewModuleManager(rpc).Info(context.Background(), ExploitModuleType, "windows/smb/ms08_067_netapi")
+	if err != nil {
+		t.Fatalf("Info failed: %v", err)
+	}
+
+	if info.Name == "" || info.Rank != "great" {
+		t.Fatalf("unexpected info: %+v", info)
+	}
+	if len(info.Authors) != 2 || info.Authors[0] != "hdm" {
+		t.Fatalf("unexpected authors: %v", info.Authors)
+	}
+	if len(info.Targets) != 3 || info.Targets[0] != "Automatic" || info.Targets[2] != "Windows 2003 Universal" {
+		t.Fatalf("expected targets in index order, got %v", info.Targets)
+	}
+	if len(info.References) != 2 {
+		t.Fatalf("unexpected references: %+v", info.References)
+	}
+	if info.References[0].Type != "CVE" || info.References[0].Value != "2008-4250" {
+		t.Fatalf("unexpected reference: %+v", info.References[0])
+	}
+}
+
+func TestModuleManager_Info_InvalidReference(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{
+				"references": []interface{}{"CVE-2008-4250"},
+			}, nil
+		},
+	}
+
+	_, err := NewModuleManager(rpc).Info(context.Background(), ExploitModuleType, "test/module")
+	if !errors.Is(err, ErrUnexpectedResponse) {
+		t.Fatalf("expected ErrUnexpectedResponse, got %v", err)
+	}
+}
+
+func TestModuleManager_CompatiblePayloadsSessions(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleCompatiblePayloads:
+				return map[string]interface{}{"payloads": []interface{}{"windows/meterpreter/reverse_tcp"}}, nil
+			case ModuleCompatibleSessions:
+				return map[string]interface{}{"sessions": []interface{}{"1", "2"}}, nil
+			default:
+				return nil, nil
+			}
+		},
+	}
+
+	ctx := context.Background()
+	mm := NewModuleManager(rpc)
+
+	payloads, err := mm.CompatiblePayloads(ctx, "windows/smb/ms08_067_netapi")
+	if err != nil || len(payloads) != 1 || payloads[0] != "windows/meterpreter/reverse_tcp" {
+		t.Fatalf("unexpected payloads: %v %v", payloads, err)
+	}
+
+	sessions, err := mm.CompatibleSessions(ctx, "post/multi/manage/shell_to_meterpreter")
+	if err != nil || len(sessions) != 2 || sessions[1] != "2" {
+		t.Fatalf("unexpected sessions: %v %v", sessions, err)
+	}
+}
+
+func TestNewModuleWithContext_FillsInfo(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleOptions:
+				return map[string]interface{}{
+					"RHOSTS": map[string]interface{}{"type": "string", "required": true, "desc": "The target address range"},
+				}, nil
+			case ModuleInfo:
+				return map[string]interface{}{
+					"name": "TCP Port Scanner",
+					"rank": "normal",
+				}, nil
+			default:
+				return nil, nil
+			}
+		},
+	}
+
+	mod, err := NewModuleManager(rpc).Use(context.Background(), AuxiliaryModuleType, "scanner/portscan/tcp")
+	if err != nil {
+		t.Fatalf("Use failed: %v", err)
+	}
+
+	if mod.Info == nil || mod.Info.Name != "TCP Port Scanner" || mod.Info.Rank != "normal" {
+		t.Fatalf("expected module info to be filled, got %+v", mod.Info)
 	}
 }

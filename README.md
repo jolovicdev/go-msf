@@ -3,7 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/jolovicdev/go-msf.svg)](https://pkg.go.dev/github.com/jolovicdev/go-msf)
 [![Go Report Card](https://goreportcard.com/badge/github.com/jolovicdev/go-msf)](https://goreportcard.com/report/github.com/jolovicdev/go-msf)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Stable Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](https://github.com/jolovicdev/go-msf/releases)
+[![Version](https://img.shields.io/badge/version-v2.0.0-blue.svg)](https://github.com/jolovicdev/go-msf/releases)
 
 > Production-ready Go client for the Metasploit Framework RPC API. Automate penetration testing, security research, and red team operations with type-safe Go.
 
@@ -12,6 +12,8 @@
 ## Features
 
 - **Complete RPC Coverage** — Core, modules, consoles, sessions, jobs, plugins, auth, and database operations
+- **Event Monitoring** — `Client.Events` polls sessions, jobs and watched output streams and emits state changes on a channel; the foundation for UIs and automation
+- **Automatic Re-auth** — Clients built with `NewClient` re-authenticate once and retry when msfrpcd invalidates their token
 - **Type-Safe API** — Strongly typed requests and responses with validation
 - **Context Support** — Full `context.Context` integration for timeouts and cancellation
 - **Error Handling** — Structured error types for RPC failures, timeouts, and validation errors
@@ -24,11 +26,11 @@
 go get github.com/jolovicdev/go-msf
 ```
 
-Requires Go 1.21 or later.
+Requires Go 1.26 or later.
 
 ## Version
 
-**Stable v1.0.0** — API locked. Only backward-compatible additions and patches following [Semantic Versioning](https://semver.org/).
+**v2.0.0** — See [releases](https://github.com/jolovicdev/go-msf/releases) for changes. Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## Quick Start
 

@@ -53,7 +53,7 @@ type RPCCaller interface {
 
 type VersionInfo struct {
 	Version     string `msgpack:"version" json:"version"`
-	RubyVersion string `msgpack:"ruby_version" json:"ruby_version"`
+	RubyVersion string `msgpack:"ruby" json:"ruby"`
 	APIVersion  string `msgpack:"api" json:"api"`
 }
 
@@ -96,15 +96,21 @@ type Job struct {
 	Description string `msgpack:"description" json:"description"`
 }
 
+type ModuleReference struct {
+	Type  string `msgpack:"type" json:"type"`
+	Value string `msgpack:"value" json:"value"`
+}
+
 type MsfModuleInfo struct {
-	Name        string   `msgpack:"name" json:"name"`
-	Description string   `msgpack:"description" json:"description"`
-	License     string   `msgpack:"license" json:"license"`
-	FilePath    string   `msgpack:"filepath" json:"filepath"`
-	Version     string   `msgpack:"version" json:"version"`
-	Rank        string   `msgpack:"rank" json:"rank"`
-	References  []string `msgpack:"references" json:"references"`
-	Authors     []string `msgpack:"authors" json:"authors"`
+	Name        string            `msgpack:"name" json:"name"`
+	Description string            `msgpack:"description" json:"description"`
+	License     string            `msgpack:"license" json:"license"`
+	FilePath    string            `msgpack:"filepath" json:"filepath"`
+	Version     string            `msgpack:"version" json:"version"`
+	Rank        string            `msgpack:"rank" json:"rank"`
+	Targets     []string          `msgpack:"targets" json:"targets"`
+	References  []ModuleReference `msgpack:"references" json:"references"`
+	Authors     []string          `msgpack:"authors" json:"authors"`
 }
 
 type MsfModuleOption struct {
@@ -126,6 +132,7 @@ type Host struct {
 	Address     string `msgpack:"address" json:"address"`
 	Mac         string `msgpack:"mac" json:"mac"`
 	Name        string `msgpack:"name" json:"name"`
+	State       string `msgpack:"state" json:"state"`
 	OSName      string `msgpack:"os_name" json:"os_name"`
 	OSFlavor    string `msgpack:"os_flavor" json:"os_flavor"`
 	OSVersion   string `msgpack:"os_version" json:"os_version"`
@@ -149,30 +156,27 @@ type Service struct {
 }
 
 type Vuln struct {
-	ID   int      `msgpack:"id" json:"id"`
-	Host string   `msgpack:"host" json:"host"`
-	Name string   `msgpack:"name" json:"name"`
-	Info string   `msgpack:"info" json:"info"`
-	Refs []string `msgpack:"refs" json:"refs"`
+	Host  string `msgpack:"host" json:"host"`
+	Name  string `msgpack:"name" json:"name"`
+	Port  int    `msgpack:"port" json:"port"`
+	Proto string `msgpack:"proto" json:"proto"`
+	Refs  string `msgpack:"refs" json:"refs"`
 }
 
 type Credential struct {
-	ID      int    `msgpack:"id" json:"id"`
 	Host    string `msgpack:"host" json:"host"`
 	Port    int    `msgpack:"port" json:"port"`
 	Proto   string `msgpack:"proto" json:"proto"`
 	Service string `msgpack:"sname" json:"sname"`
 	User    string `msgpack:"user" json:"user"`
 	Pass    string `msgpack:"pass" json:"pass"`
-	Active  bool   `msgpack:"active" json:"active"`
-	Proof   string `msgpack:"proof" json:"proof"`
-	Type    string `msgpack:"ptype" json:"ptype"`
+	Type    string `msgpack:"type" json:"type"`
 }
 
 type Loot struct {
-	ID   int    `msgpack:"id" json:"id"`
 	Host string `msgpack:"host" json:"host"`
 	Type string `msgpack:"ltype" json:"ltype"`
 	Name string `msgpack:"name" json:"name"`
 	Data string `msgpack:"data" json:"data"`
+	Info string `msgpack:"info" json:"info"`
 }
