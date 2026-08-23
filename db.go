@@ -50,7 +50,7 @@ func (m *DbManager) Disconnect(ctx context.Context) error {
 }
 
 func (m *DbManager) Driver(ctx context.Context) (string, error) {
-	result, err := m.rpc.Call(ctx, DbDriver)
+	result, err := m.rpc.Call(ctx, DbDriver, map[string]interface{}{})
 	if err != nil {
 		return "", err
 	}
@@ -89,6 +89,76 @@ func (m *DbManager) SetWorkspace(ctx context.Context, name string) error {
 	return err
 }
 
+// The db.* read methods take an options hash. Recognized keys include
+// "workspace", "limit" and "offset"; a nil opts queries the current
+// workspace. See the Metasploit RPC documentation for per-method filters.
+func dbOptions(opts map[string]interface{}) map[string]interface{} {
+	if opts == nil {
+		return map[string]interface{}{}
+	}
+	return opts
+}
+
+func (m *DbManager) Hosts(ctx context.Context, opts map[string]interface{}) ([]*Host, error) {
+	result, err := m.rpc.Call(ctx, DbHosts, dbOptions(opts))
+	if err != nil {
+		if rpcErrorMessage(err, "Database Not Loaded") {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return decodeList[Host](result, "hosts")
+}
+
+func (m *DbManager) Services(ctx context.Context, opts map[string]interface{}) ([]*Service, error) {
+	result, err := m.rpc.Call(ctx, DbServices, dbOptions(opts))
+	if err != nil {
+		if rpcErrorMessage(err, "Database Not Loaded") {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return decodeList[Service](result, "services")
+}
+
+func (m *DbManager) Vulns(ctx context.Context, opts map[string]interface{}) ([]*Vuln, error) {
+	result, err := m.rpc.Call(ctx, DbVulns, dbOptions(opts))
+	if err != nil {
+		if rpcErrorMessage(err, "Database Not Loaded") {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return decodeList[Vuln](result, "vulns")
+}
+
+func (m *DbManager) Loots(ctx context.Context, opts map[string]interface{}) ([]*Loot, error) {
+	result, err := m.rpc.Call(ctx, DbLoots, dbOptions(opts))
+	if err != nil {
+		if rpcErrorMessage(err, "Database Not Loaded") {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return decodeList[Loot](result, "loots")
+}
+
+func (m *DbManager) Creds(ctx context.Context, opts map[string]interface{}) ([]*Credential, error) {
+	result, err := m.rpc.Call(ctx, DbCreds, dbOptions(opts))
+	if err != nil {
+		if rpcErrorMessage(err, "Database Not Loaded") {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return decodeList[Credential](result, "creds")
+}
+
 type WorkspaceManager struct {
 	rpc RPCCaller
 }
@@ -106,7 +176,16 @@ func (m *WorkspaceManager) List(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
-	return responseStringSlice(result, "workspaces")
+	workspaces, err := decodeList[Workspace](result, "workspaces")
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(workspaces))
+	for _, w := range workspaces {
+		names = append(names, w.Name)
+	}
+	return names, nil
 }
 
 func (m *WorkspaceManager) Add(ctx context.Context, name string) error {
@@ -130,17 +209,17 @@ func (m *WorkspaceManager) Get(ctx context.Context, name string) (*Workspace, er
 		return nil, err
 	}
 
-	workspaceData, ok := data["workspace"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("%w: expected workspace map", ErrUnexpectedResponse)
+	workspaceList, ok := data["workspace"].([]interface{})
+	if !ok || len(workspaceList) == 0 {
+		return nil, fmt.Errorf("%w: expected workspace list", ErrUnexpectedResponse)
 	}
 
-	name, err = responseString(workspaceData, "name")
-	if err != nil {
+	var workspace Workspace
+	if err := decodeResult(workspaceList[0], &workspace); err != nil {
 		return nil, err
 	}
 
-	return &Workspace{Name: name}, nil
+	return &workspace, nil
 }
 
 func (m *WorkspaceManager) Current(ctx context.Context) (*Workspace, error) {
