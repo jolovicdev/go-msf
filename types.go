@@ -96,15 +96,21 @@ type Job struct {
 	Description string `msgpack:"description" json:"description"`
 }
 
+type ModuleReference struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
 type MsfModuleInfo struct {
-	Name        string   `msgpack:"name" json:"name"`
-	Description string   `msgpack:"description" json:"description"`
-	License     string   `msgpack:"license" json:"license"`
-	FilePath    string   `msgpack:"filepath" json:"filepath"`
-	Version     string   `msgpack:"version" json:"version"`
-	Rank        string   `msgpack:"rank" json:"rank"`
-	References  []string `msgpack:"references" json:"references"`
-	Authors     []string `msgpack:"authors" json:"authors"`
+	Name        string            `msgpack:"name" json:"name"`
+	Description string            `msgpack:"description" json:"description"`
+	License     string            `msgpack:"license" json:"license"`
+	FilePath    string            `msgpack:"filepath" json:"filepath"`
+	Version     string            `msgpack:"version" json:"version"`
+	Rank        string            `msgpack:"rank" json:"rank"`
+	Targets     []string          `msgpack:"targets" json:"targets"`
+	References  []ModuleReference `msgpack:"references" json:"references"`
+	Authors     []string          `msgpack:"authors" json:"authors"`
 }
 
 type MsfModuleOption struct {
