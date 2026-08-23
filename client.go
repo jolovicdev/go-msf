@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,8 +19,10 @@ type Client struct {
 	uri                 string
 	ssl                 bool
 	username            string
+	password            string
 	token               string
 	tokenMu             sync.RWMutex
+	reauthMu            sync.Mutex
 	client              *http.Client
 	consolePollInterval time.Duration
 	sessionPollInterval time.Duration
@@ -105,6 +108,8 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 		return nil, err
 	}
 
+	c.password = password
+
 	return c, nil
 }
 
@@ -141,7 +146,24 @@ func (c *Client) url() string {
 	return fmt.Sprintf("%s://%s:%d%s", scheme, c.host, c.port, c.uri)
 }
 
+// Call performs an RPC round trip. If the server rejects the token and the
+// client was constructed with NewClient, it re-authenticates once and retries.
 func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+	failedToken := c.Token()
+
+	result, err := c.call(ctx, method, args...)
+	if err == nil || method == AuthLogin || c.password == "" || !isInvalidTokenError(err) {
+		return result, err
+	}
+
+	if err := c.reloginIfStale(ctx, failedToken); err != nil {
+		return nil, err
+	}
+
+	return c.call(ctx, method, args...)
+}
+
+func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
 	c.tokenMu.RLock()
 	token := c.token
 	c.tokenMu.RUnlock()
@@ -177,8 +199,14 @@ func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	}
 	defer resp.Body.Close()
 
+	// msfrpcd encodes strings as binary and some maps (module.info targets)
+	// with integer keys, so decode maps with tolerant keys and normalize
+	// afterwards.
+	decoder := msgpack.NewDecoder(resp.Body)
+	decoder.SetMapDecoder(stringKeyedMap)
+
 	var result interface{}
-	if err := msgpack.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decoder.Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
@@ -251,6 +279,66 @@ func (c *Client) IsAuthenticated() bool {
 	return c.token != ""
 }
 
+func (c *Client) reloginIfStale(ctx context.Context, failedToken string) error {
+	c.reauthMu.Lock()
+	defer c.reauthMu.Unlock()
+
+	if c.Token() != failedToken {
+		return nil
+	}
+
+	return c.login(c.username, c.password)
+}
+
+func isInvalidTokenError(err error) bool {
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	message := strings.EqualFold(rpcErr.Message, "Invalid Authentication Token") ||
+		strings.EqualFold(rpcErr.Message, "Invalid Token")
+	return message
+}
+
+// stringKeyedMap decodes a msgpack map into map[string]interface{} regardless
+// of the wire key type: binary and string keys map directly, other key types
+// (msfrpcd uses integer indices) are formatted.
+func stringKeyedMap(d *msgpack.Decoder) (interface{}, error) {
+	n, err := d.DecodeMapLen()
+	if err != nil {
+		return nil, err
+	}
+	if n == -1 {
+		return nil, nil
+	}
+
+	m := make(map[string]interface{}, n)
+	for i := 0; i < n; i++ {
+		key, err := d.DecodeInterface()
+		if err != nil {
+			return nil, err
+		}
+		value, err := d.DecodeInterface()
+		if err != nil {
+			return nil, err
+		}
+		m[interfaceKeyToString(key)] = value
+	}
+
+	return m, nil
+}
+
+func interfaceKeyToString(key interface{}) string {
+	switch k := key.(type) {
+	case string:
+		return k
+	case []byte:
+		return string(k)
+	default:
+		return fmt.Sprintf("%v", k)
+	}
+}
+
 func convertBytesToString(v interface{}) interface{} {
 	switch val := v.(type) {
 	case []byte:
@@ -293,6 +381,29 @@ func decodeResult(data interface{}, target interface{}) error {
 	return msgpack.Unmarshal(encoded, target)
 }
 
+func decodeList[T any](result interface{}, key string) ([]*T, error) {
+	data, err := responseMap(result)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, ok := data[key].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("%w: expected %s list", ErrUnexpectedResponse, key)
+	}
+
+	values := make([]*T, 0, len(raw))
+	for i, item := range raw {
+		var value T
+		if err := decodeResult(item, &value); err != nil {
+			return nil, fmt.Errorf("%w: invalid %s[%d]", ErrUnexpectedResponse, key, i)
+		}
+		values = append(values, &value)
+	}
+
+	return values, nil
+}
+
 func responseMap(result interface{}) (map[string]interface{}, error) {
 	m, ok := result.(map[string]interface{})
 	if !ok {
@@ -330,6 +441,11 @@ func responseString(data map[string]interface{}, key string) (string, error) {
 		return "", fmt.Errorf("%w: expected %s string", ErrUnexpectedResponse, key)
 	}
 	return value, nil
+}
+
+func optionalString(data map[string]interface{}, key string) string {
+	value, _ := data[key].(string)
+	return value
 }
 
 func responseRPCError(result interface{}) (*RPCError, bool) {
