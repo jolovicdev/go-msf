@@ -1,0 +1,31 @@
+name: DS-Review Action
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.sender.type != 'Bot' &&
+      (
+        github.event_name == 'pull_request' ||
+        (
+          github.event.issue.pull_request &&
+          contains(github.event.comment.body, '@ds-review') &&
+          contains('OWNER,MEMBER,COLLABORATOR', github.event.comment.author_association)
+        )
+      )
+    steps:
+      - name: DS-Review
+        uses: jolovicdev/ds-review@v0.1.3
+        with:
+          deepseek_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}

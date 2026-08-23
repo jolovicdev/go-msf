@@ -12,6 +12,8 @@
 ## Features
 
 - **Complete RPC Coverage** — Core, modules, consoles, sessions, jobs, plugins, auth, and database operations
+- **Event Monitoring** — `Client.Events` polls sessions, jobs and watched output streams and emits state changes on a channel; the foundation for UIs and automation
+- **Automatic Re-auth** — Clients built with `NewClient` re-authenticate once and retry when msfrpcd invalidates their token
 - **Type-Safe API** — Strongly typed requests and responses with validation
 - **Context Support** — Full `context.Context` integration for timeouts and cancellation
 - **Error Handling** — Structured error types for RPC failures, timeouts, and validation errors
@@ -24,7 +26,7 @@
 go get github.com/jolovicdev/go-msf
 ```
 
-Requires Go 1.21 or later.
+Requires Go 1.26 or later.
 
 ## Version
 
