@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	gomsf "github.com/jolovicdev/go-msf"
+	gomsf "github.com/jolovicdev/go-msf/v2"
 )
 
 func main() {
