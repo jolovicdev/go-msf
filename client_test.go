@@ -474,3 +474,39 @@ func TestClientCall_ReauthWaitHonorsContext(t *testing.T) {
 
 	<-firstDone
 }
+
+func TestClientCall_RPCErrorClassComesFromErrorClass(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = msgpack.NewEncoder(w).Encode(map[string]interface{}{
+			"error":         true,
+			"error_class":   "ArgumentError",
+			"error_string":  "wrong number of arguments",
+			"error_message": "wrong number of arguments",
+		})
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	_, err = client.Call(context.Background(), CoreVersion)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("expected *RPCError, got %v", err)
+	}
+	if rpcErr.Class != "ArgumentError" {
+		t.Fatalf("expected class ArgumentError, got %q", rpcErr.Class)
+	}
+}
