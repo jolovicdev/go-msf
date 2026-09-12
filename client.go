@@ -610,3 +610,13 @@ func waitForPoll(ctx context.Context, interval time.Duration) error {
 		return nil
 	}
 }
+
+// commandTimeoutError maps errors raised by a command helper's own deadline
+// onto ErrCommandTimeout. Cancellation of the caller's context and unrelated
+// RPC failures pass through unchanged.
+func commandTimeoutError(parent, cmd context.Context, command string, err error) error {
+	if parent.Err() == nil && cmd.Err() != nil {
+		return fmt.Errorf("%w: %s", ErrCommandTimeout, command)
+	}
+	return err
+}

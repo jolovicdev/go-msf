@@ -181,38 +181,36 @@ func (c *MsfConsole) IsBusy(ctx context.Context) (bool, error) {
 // command alone. The command is complete once the console has been busy and
 // then reports idle; a command that never makes the console busy and
 // produces no output cannot be told apart from a queued command and runs
-// into the timeout.
-func (c *MsfConsole) RunCommand(ctx context.Context, command string, timeout time.Duration) (string, error) {
-	start := time.Now()
+// into the timeout. The timeout bounds the whole helper: draining, the
+// write, every read and every poll wait.
+func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 
-	for time.Since(start) < timeout {
+	for {
 		result, err := c.Read(ctx)
 		if err != nil {
-			return "", err
+			return "", commandTimeoutError(parent, ctx, command, err)
 		}
 		if !result.Busy {
 			break
 		}
 		if err := waitForPoll(ctx, c.pollInterval); err != nil {
-			return "", err
+			return "", commandTimeoutError(parent, ctx, command, err)
 		}
 	}
 
 	if err := c.Write(ctx, command); err != nil {
-		return "", err
+		return "", commandTimeoutError(parent, ctx, command, err)
 	}
 
 	var output string
 	started := false
 
-	for time.Since(start) < timeout {
-		if err := ctx.Err(); err != nil {
-			return output, err
-		}
-
+	for {
 		result, err := c.Read(ctx)
 		if err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, command, err)
 		}
 		output += result.Data
 
@@ -222,9 +220,7 @@ func (c *MsfConsole) RunCommand(ctx context.Context, command string, timeout tim
 		}
 
 		if err := waitForPoll(ctx, c.pollInterval); err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, command, err)
 		}
 	}
-
-	return output, fmt.Errorf("%w: %s", ErrCommandTimeout, command)
 }

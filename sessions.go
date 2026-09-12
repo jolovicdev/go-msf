@@ -158,26 +158,23 @@ func (s *MeterpreterSession) DirectorySeparator(ctx context.Context) (string, er
 	return responseString(data, "separator")
 }
 
-func (s *MeterpreterSession) RunWithOutput(ctx context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
+// RunWithOutput writes cmd and collects output until one of endStrings
+// appears in it, or until any output arrives when endStrings is nil. The
+// timeout bounds the whole helper: the write, every read and every poll
+// wait.
+func (s *MeterpreterSession) RunWithOutput(parent context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
 	if err := s.Write(ctx, cmd); err != nil {
-		return "", err
+		return "", commandTimeoutError(parent, ctx, cmd, err)
 	}
 
-	return s.gatherOutput(ctx, cmd, endStrings, timeout)
-}
-
-func (s *MeterpreterSession) gatherOutput(ctx context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
 	var output string
-	start := time.Now()
-
-	for time.Since(start) < timeout {
-		if err := ctx.Err(); err != nil {
-			return output, err
-		}
-
+	for {
 		data, err := s.Read(ctx)
 		if err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, cmd, err)
 		}
 		output += data
 
@@ -194,11 +191,9 @@ func (s *MeterpreterSession) gatherOutput(ctx context.Context, cmd string, endSt
 		}
 
 		if err := waitForPoll(ctx, s.pollInterval); err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, cmd, err)
 		}
 	}
-
-	return output, fmt.Errorf("%w: %s", ErrCommandTimeout, cmd)
 }
 
 type ShellSession struct {
@@ -243,22 +238,22 @@ func (s *ShellSession) Upgrade(ctx context.Context, lhost string, lport int) err
 	return err
 }
 
-func (s *ShellSession) RunWithOutput(ctx context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
+// RunWithOutput writes cmd and collects output until one of endStrings
+// appears in it. The timeout bounds the whole helper: the write, every read
+// and every poll wait.
+func (s *ShellSession) RunWithOutput(parent context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
 	if err := s.Write(ctx, cmd); err != nil {
-		return "", err
+		return "", commandTimeoutError(parent, ctx, cmd, err)
 	}
 
 	var output string
-	start := time.Now()
-
-	for time.Since(start) < timeout {
-		if err := ctx.Err(); err != nil {
-			return output, err
-		}
-
+	for {
 		data, err := s.Read(ctx)
 		if err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, cmd, err)
 		}
 		output += data
 
@@ -269,9 +264,7 @@ func (s *ShellSession) RunWithOutput(ctx context.Context, cmd string, endStrings
 		}
 
 		if err := waitForPoll(ctx, s.pollInterval); err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, cmd, err)
 		}
 	}
-
-	return output, fmt.Errorf("%w: %s", ErrCommandTimeout, cmd)
 }

@@ -251,3 +251,28 @@ func TestMsfConsole_RunCommandCompletesWithoutFinalOutput(t *testing.T) {
 		t.Errorf("unexpected output: %q", out)
 	}
 }
+
+func TestMsfConsole_RunCommandTimeoutBoundsReads(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method == ConsoleRead {
+				select {
+				case <-time.After(120 * time.Millisecond):
+					return map[string]interface{}{"data": "DONE", "busy": false}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return map[string]interface{}{}, nil
+		},
+	}
+
+	start := time.Now()
+	_, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 20*time.Millisecond)
+	if !errors.Is(err, ErrCommandTimeout) {
+		t.Fatalf("expected ErrCommandTimeout, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("20ms timeout took %s", elapsed)
+	}
+}
