@@ -193,7 +193,7 @@ func TestConsoleWrappers_FailureResultReturnsConsoleNotFound(t *testing.T) {
 	}
 }
 
-func TestMsfConsole_RunCommandRequiresBusyBeforeIdle(t *testing.T) {
+func TestMsfConsole_RunCommandDoesNotCompleteOnStaleIdleOutput(t *testing.T) {
 	var reads int
 	rpc := fakeRPCCaller{
 		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
@@ -222,6 +222,30 @@ func TestMsfConsole_RunCommandRequiresBusyBeforeIdle(t *testing.T) {
 	}
 	if !strings.Contains(out, "command output") {
 		t.Errorf("missing command output: %q", out)
+	}
+}
+
+func TestMsfConsole_RunCommandCompletesFastCommandWithoutBusy(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			if reads == 1 {
+				return map[string]interface{}{"data": "", "busy": false}, nil
+			}
+			return map[string]interface{}{"data": "command output\n", "busy": false}, nil
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if out != "command output\n" {
+		t.Errorf("unexpected output: %q", out)
 	}
 }
 

@@ -176,12 +176,15 @@ func (c *MsfConsole) IsBusy(ctx context.Context) (bool, error) {
 }
 
 // RunCommand writes command to the console and returns the output it
-// collects, including anything already pending on the console. Completion
-// requires the console to report busy at least once and then idle: an idle
-// read carrying stale output (a fresh console still holds its banner) is
-// not evidence the command ran. A command too short to ever be observed
-// busy therefore runs into the timeout. The timeout bounds the whole
-// helper: the write, every read and every poll wait.
+// collects, including anything already pending on the console. A command is
+// complete once an idle read follows activity (the console reporting busy,
+// or output arriving) on a later read than the first one after the write:
+// the framework needs a moment to pick up the command, and an idle first
+// read often carries only stale output such as a fresh console's banner. A
+// command that never reports busy and produces no output cannot be
+// distinguished from a queued command and runs into the timeout, as does
+// one whose console stays busy for the whole timeout. The timeout bounds
+// the whole helper: the write, every read and every poll wait.
 func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
@@ -192,6 +195,7 @@ func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout 
 
 	var output string
 	started := false
+	first := true
 
 	for {
 		result, err := c.Read(ctx)
@@ -200,10 +204,11 @@ func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout 
 		}
 		output += result.Data
 
-		started = started || result.Busy
-		if !result.Busy && started {
+		started = started || result.Busy || result.Data != ""
+		if !first && !result.Busy && started {
 			return output, nil
 		}
+		first = false
 
 		if err := waitForPoll(ctx, c.pollInterval); err != nil {
 			return output, commandTimeoutError(parent, ctx, command, err)
