@@ -22,8 +22,10 @@ type Client struct {
 	username            string
 	password            string
 	token               string
+	authGeneration      uint64
 	tokenMu             sync.RWMutex
 	reauthMu            sync.Mutex
+	reauthWait          chan struct{}
 	client              *http.Client
 	consolePollInterval time.Duration
 	sessionPollInterval time.Duration
@@ -105,11 +107,15 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 		}
 	}
 
-	if err := c.login(context.Background(), c.username, password); err != nil {
+	token, err := c.login(context.Background(), c.username, password)
+	if err != nil {
 		return nil, err
 	}
 
+	c.tokenMu.Lock()
+	c.token = token
 	c.password = password
+	c.tokenMu.Unlock()
 
 	return c, nil
 }
@@ -158,18 +164,21 @@ func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interfac
 		return result, err
 	}
 
-	if err := c.reloginIfStale(ctx, failedToken); err != nil {
+	token, err := c.reloginIfStale(ctx, failedToken)
+	if err != nil {
 		return nil, err
 	}
 
-	return c.call(ctx, method, args...)
+	return c.callWithToken(ctx, token, method, args...)
 }
 
 func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
-	c.tokenMu.RLock()
-	token := c.token
-	c.tokenMu.RUnlock()
+	return c.callWithToken(ctx, c.Token(), method, args...)
+}
 
+// callWithToken performs the RPC round trip authenticated with token. Every
+// method except auth.login requires one.
+func (c *Client) callWithToken(ctx context.Context, token string, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
 	if method != AuthLogin && token == "" {
 		return nil, ErrNotAuthenticated
 	}
@@ -231,31 +240,29 @@ func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	return result, nil
 }
 
-func (c *Client) login(ctx context.Context, username, password string) error {
+// login performs auth.login and returns the fresh token without storing it;
+// callers decide whether the client keeps the session.
+func (c *Client) login(ctx context.Context, username, password string) (string, error) {
 	result, err := c.Call(ctx, AuthLogin, username, password)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	m, ok := result.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("%w: expected auth result map", ErrUnexpectedResponse)
+		return "", fmt.Errorf("%w: expected auth result map", ErrUnexpectedResponse)
 	}
 
 	if res, ok := m["result"].(string); !ok || res != "success" {
-		return fmt.Errorf("authentication failed")
+		return "", fmt.Errorf("authentication failed")
 	}
 
 	token, ok := m["token"].(string)
 	if !ok {
-		return fmt.Errorf("%w: missing auth token", ErrUnexpectedResponse)
+		return "", fmt.Errorf("%w: missing auth token", ErrUnexpectedResponse)
 	}
 
-	c.tokenMu.Lock()
-	c.token = token
-	c.tokenMu.Unlock()
-
-	return nil
+	return token, nil
 }
 
 func (c *Client) Logout(ctx context.Context) error {
@@ -274,9 +281,12 @@ func (c *Client) Logout(ctx context.Context) error {
 		return err
 	}
 
+	// Bumping the generation rejects login results from callers that were
+	// already re-authenticating when the logout happened.
 	c.tokenMu.Lock()
 	c.token = ""
 	c.password = ""
+	c.authGeneration++
 	c.tokenMu.Unlock()
 
 	return nil
@@ -300,19 +310,62 @@ func (c *Client) IsAuthenticated() bool {
 	return c.token != ""
 }
 
-func (c *Client) reloginIfStale(ctx context.Context, failedToken string) error {
-	c.reauthMu.Lock()
-	defer c.reauthMu.Unlock()
+// reloginIfStale re-authenticates a client whose token the server rejected
+// and returns the token the caller should retry with. Only one login runs at
+// a time; concurrent callers wait for it and reuse its result, and the wait
+// honors ctx. A login that completes after Logout does not restore the
+// session: the fresh token is handed to the retrying caller only.
+func (c *Client) reloginIfStale(ctx context.Context, failedToken string) (string, error) {
+	for {
+		c.reauthMu.Lock()
+		if c.reauthWait == nil {
+			wait := make(chan struct{})
+			c.reauthWait = wait
+			c.reauthMu.Unlock()
 
-	if c.Token() != failedToken {
-		return nil
+			defer func() {
+				c.reauthMu.Lock()
+				c.reauthWait = nil
+				c.reauthMu.Unlock()
+				close(wait)
+			}()
+
+			if token := c.Token(); token != failedToken {
+				return token, nil
+			}
+
+			c.tokenMu.RLock()
+			generation := c.authGeneration
+			password := c.password
+			c.tokenMu.RUnlock()
+
+			token, err := c.login(ctx, c.username, password)
+			if err != nil {
+				return "", err
+			}
+
+			c.tokenMu.Lock()
+			if c.authGeneration == generation {
+				c.token = token
+			}
+			c.tokenMu.Unlock()
+
+			return token, nil
+		}
+
+		wait := c.reauthWait
+		c.reauthMu.Unlock()
+
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+
+		if token := c.Token(); token != failedToken {
+			return token, nil
+		}
 	}
-
-	c.tokenMu.RLock()
-	password := c.password
-	c.tokenMu.RUnlock()
-
-	return c.login(ctx, c.username, password)
 }
 
 func isInvalidTokenError(err error) bool {
