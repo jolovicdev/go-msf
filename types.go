@@ -123,9 +123,13 @@ type MsfModuleOption struct {
 	Enums    []string    `msgpack:"enums,omitempty" json:"enums,omitempty"`
 }
 
+// ModuleExecuteResult is the response to module.execute. Exploit, auxiliary
+// and post modules start a job and set JobID and UUID; executing a payload
+// module instead generates the payload, carried in Payload.
 type ModuleExecuteResult struct {
-	JobID int    `msgpack:"job_id" json:"job_id"`
-	UUID  string `msgpack:"uuid" json:"uuid"`
+	JobID   int    `msgpack:"job_id" json:"job_id"`
+	UUID    string `msgpack:"uuid" json:"uuid"`
+	Payload string `msgpack:"payload" json:"payload"`
 }
 
 type Host struct {

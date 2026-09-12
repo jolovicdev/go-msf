@@ -331,3 +331,19 @@ func TestModule_CompatibleSessionsSendsFullPath(t *testing.T) {
 		}
 	}
 }
+
+func TestModuleManager_ExecuteDecodesPayloadResult(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"payload": "printf review"}, nil
+		},
+	}
+
+	result, err := NewModuleManager(rpc).Execute(context.Background(), PayloadModuleType, "cmd/unix/generic", map[string]interface{}{"CMD": "printf review"})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Payload != "printf review" {
+		t.Fatalf("expected generated payload, got %+v", result)
+	}
+}
