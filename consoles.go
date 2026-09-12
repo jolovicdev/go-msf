@@ -175,13 +175,35 @@ func (c *MsfConsole) IsBusy(ctx context.Context) (bool, error) {
 	return false, ErrConsoleNotFound
 }
 
+// RunCommand writes command to the console and returns the output it
+// produces. Output already pending on the console (a fresh console still
+// holds its banner) is drained first, so the returned output belongs to
+// command alone. The command is complete once the console has been busy and
+// then reports idle; a command that never makes the console busy and
+// produces no output cannot be told apart from a queued command and runs
+// into the timeout.
 func (c *MsfConsole) RunCommand(ctx context.Context, command string, timeout time.Duration) (string, error) {
+	start := time.Now()
+
+	for time.Since(start) < timeout {
+		result, err := c.Read(ctx)
+		if err != nil {
+			return "", err
+		}
+		if !result.Busy {
+			break
+		}
+		if err := waitForPoll(ctx, c.pollInterval); err != nil {
+			return "", err
+		}
+	}
+
 	if err := c.Write(ctx, command); err != nil {
 		return "", err
 	}
 
-	start := time.Now()
 	var output string
+	started := false
 
 	for time.Since(start) < timeout {
 		if err := ctx.Err(); err != nil {
@@ -194,7 +216,8 @@ func (c *MsfConsole) RunCommand(ctx context.Context, command string, timeout tim
 		}
 		output += result.Data
 
-		if !result.Busy && result.Data != "" {
+		started = started || result.Busy || result.Data != ""
+		if !result.Busy && started {
 			return output, nil
 		}
 

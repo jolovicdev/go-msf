@@ -3,6 +3,7 @@ package gomsf
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -189,5 +190,64 @@ func TestConsoleWrappers_FailureResultReturnsConsoleNotFound(t *testing.T) {
 	}
 	if err := NewConsoleManager(rpc).Destroy(ctx, "999999"); !errors.Is(err, ErrConsoleNotFound) {
 		t.Errorf("Destroy: expected ErrConsoleNotFound, got %v", err)
+	}
+}
+
+func TestMsfConsole_RunCommandDrainsPendingOutput(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			switch reads {
+			case 1:
+				return map[string]interface{}{"data": "banner output\n", "prompt": "msf > ", "busy": false}, nil
+			case 2:
+				return map[string]interface{}{"data": "", "prompt": "msf > ", "busy": true}, nil
+			case 3:
+				return map[string]interface{}{"data": "command output\n", "prompt": "msf > ", "busy": false}, nil
+			default:
+				return map[string]interface{}{"data": "", "prompt": "msf > ", "busy": false}, nil
+			}
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if strings.Contains(out, "banner") {
+		t.Errorf("pending banner output leaked into command output: %q", out)
+	}
+	if !strings.Contains(out, "command output") {
+		t.Errorf("missing command output: %q", out)
+	}
+}
+
+func TestMsfConsole_RunCommandCompletesWithoutFinalOutput(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			switch reads {
+			case 2:
+				return map[string]interface{}{"data": "command output\n", "busy": true}, nil
+			default:
+				return map[string]interface{}{"data": "", "busy": false}, nil
+			}
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if out != "command output\n" {
+		t.Errorf("unexpected output: %q", out)
 	}
 }
