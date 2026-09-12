@@ -319,13 +319,30 @@ func (m *Module) MissingRequired() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for k, v := range m.options {
-		if v.Required {
-			if _, ok := m.runOptions[k]; !ok {
-				missing = append(missing, k)
-			}
+		if v.Required && !usableOptionValue(m.runOptions[k]) {
+			missing = append(missing, k)
 		}
 	}
 	return missing
+}
+
+// usableOptionValue reports whether a required option value can be used:
+// nil and empty strings carry no configuration and empty slices carry no
+// entries, while false and zero are valid values for bool and integer
+// options.
+func usableOptionValue(value interface{}) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return v != ""
+	case []interface{}:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	default:
+		return true
+	}
 }
 
 func (m *Module) OptionInfo(option string) (*MsfModuleOption, error) {
@@ -337,7 +354,7 @@ func (m *Module) OptionInfo(option string) (*MsfModuleOption, error) {
 }
 
 func (m *Module) GetOption(option string) (interface{}, error) {
-	if _, ok := m.options[option]; !ok {
+	if _, ok := m.options[option]; !ok && !isExecutionOption(option) {
 		return nil, invalidOptionError(option)
 	}
 	m.mu.RLock()
@@ -347,11 +364,11 @@ func (m *Module) GetOption(option string) (interface{}, error) {
 
 func (m *Module) SetOption(option string, value interface{}) error {
 	opt, ok := m.options[option]
-	if !ok {
+	if !ok && !isExecutionOption(option) {
 		return invalidOptionError(option)
 	}
 
-	if len(opt.Enums) > 0 {
+	if ok && len(opt.Enums) > 0 {
 		found := false
 		for _, e := range opt.Enums {
 			if e == value {
@@ -368,6 +385,13 @@ func (m *Module) SetOption(option string, value interface{}) error {
 	m.runOptions[option] = value
 	m.mu.Unlock()
 	return nil
+}
+
+// isExecutionOption reports whether option selects how the module runs
+// rather than configuring a registered option: TARGET and PAYLOAD are
+// missing from the module.options response.
+func isExecutionOption(option string) bool {
+	return option == "TARGET" || option == "PAYLOAD"
 }
 
 func (m *Module) RunOptions() map[string]interface{} {

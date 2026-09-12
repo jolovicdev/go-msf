@@ -3,6 +3,7 @@ package gomsf
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -345,5 +346,55 @@ func TestModuleManager_ExecuteDecodesPayloadResult(t *testing.T) {
 	}
 	if result.Payload != "printf review" {
 		t.Fatalf("expected generated payload, got %+v", result)
+	}
+}
+
+func TestModule_ExecutionOptions(t *testing.T) {
+	mod := &Module{
+		options:    map[string]*MsfModuleOption{},
+		runOptions: make(map[string]interface{}),
+	}
+
+	if err := mod.SetOption("TARGET", 1); err != nil {
+		t.Errorf("SetOption(TARGET) failed: %v", err)
+	}
+	if err := mod.SetOption("PAYLOAD", "windows/meterpreter/reverse_tcp"); err != nil {
+		t.Errorf("SetOption(PAYLOAD) failed: %v", err)
+	}
+	if v, err := mod.GetOption("TARGET"); err != nil || v != 1 {
+		t.Errorf("GetOption(TARGET) = %v, %v", v, err)
+	}
+	if err := mod.SetOption("NOT_AN_OPTION", true); !errors.Is(err, ErrInvalidOption) {
+		t.Errorf("unknown option: expected ErrInvalidOption, got %v", err)
+	}
+}
+
+func TestModule_MissingRequiredRejectsUnusableValues(t *testing.T) {
+	mod := &Module{
+		options: map[string]*MsfModuleOption{
+			"RHOSTS":  {Type: "string", Required: true},
+			"THREADS": {Type: "integer", Required: true},
+		},
+		runOptions: map[string]interface{}{"THREADS": 0},
+	}
+
+	if missing := mod.MissingRequired(); !slices.Contains(missing, "RHOSTS") || slices.Contains(missing, "THREADS") {
+		t.Fatalf("expected only RHOSTS missing, got %v", missing)
+	}
+
+	for _, value := range []interface{}{"", nil} {
+		if err := mod.SetOption("RHOSTS", value); err != nil {
+			t.Fatalf("SetOption(RHOSTS, %v) failed: %v", value, err)
+		}
+		if missing := mod.MissingRequired(); !slices.Contains(missing, "RHOSTS") {
+			t.Fatalf("RHOSTS=%v should stay missing, got %v", value, missing)
+		}
+	}
+
+	if err := mod.SetOption("RHOSTS", "127.0.0.1"); err != nil {
+		t.Fatalf("SetOption(RHOSTS, host) failed: %v", err)
+	}
+	if missing := mod.MissingRequired(); slices.Contains(missing, "RHOSTS") {
+		t.Fatalf("RHOSTS set but still reported missing: %v", missing)
 	}
 }
