@@ -222,7 +222,9 @@ func (c *Client) callWithToken(ctx context.Context, token string, method MsfRpcM
 	var result interface{}
 	if err := decoder.Decode(&result); err != nil {
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("request failed: http status %d", resp.StatusCode)
+			// Wrap so a decode failure caused by the caller's cancellation
+			// still matches errors.Is(err, context.Canceled).
+			return nil, fmt.Errorf("request failed: http status %d: %w", resp.StatusCode, err)
 		}
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}

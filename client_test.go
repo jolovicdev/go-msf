@@ -510,3 +510,51 @@ func TestClientCall_RPCErrorClassComesFromErrorClass(t *testing.T) {
 		t.Fatalf("expected class ArgumentError, got %q", rpcErr.Class)
 	}
 }
+
+func TestClientCall_HTTPErrorPreservesCallerCancellation(t *testing.T) {
+	headersSent := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.(http.Flusher).Flush()
+		close(headersSent)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Call(ctx, CoreVersion)
+		done <- err
+	}()
+
+	<-headersSent
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost caller cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("call did not return after cancellation")
+	}
+}
