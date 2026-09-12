@@ -2,6 +2,7 @@ package gomsf
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -158,5 +159,35 @@ func TestMsfConsole_Tabs(t *testing.T) {
 
 	if tabs == nil {
 		t.Log("Tabs returned nil (this may be OK)")
+	}
+}
+
+func TestConsoleWrappers_FailureResultReturnsConsoleNotFound(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"result": "failure"}, nil
+		},
+	}
+
+	ctx := context.Background()
+	con := NewMsfConsole(rpc, "999999")
+
+	if _, err := con.Read(ctx); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Read: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := con.Write(ctx, "version"); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Write: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := con.SessionKill(ctx); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("SessionKill: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := con.SessionDetach(ctx); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("SessionDetach: expected ErrConsoleNotFound, got %v", err)
+	}
+	if _, err := con.Tabs(ctx, "ver"); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Tabs: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := NewConsoleManager(rpc).Destroy(ctx, "999999"); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Destroy: expected ErrConsoleNotFound, got %v", err)
 	}
 }

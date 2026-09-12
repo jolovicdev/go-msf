@@ -65,8 +65,15 @@ func (m *ConsoleManager) Create(ctx context.Context) (*Console, error) {
 }
 
 func (m *ConsoleManager) Destroy(ctx context.Context, cid string) error {
-	_, err := m.rpc.Call(ctx, ConsoleDestroy, cid)
-	return err
+	result, err := m.rpc.Call(ctx, ConsoleDestroy, cid)
+	if err != nil {
+		return err
+	}
+	// An unknown console ID is reported as {"result":"failure"}.
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, cid)
+	}
+	return nil
 }
 
 func (m *ConsoleManager) GetConsole(ctx context.Context, cid string) (*MsfConsole, error) {
@@ -93,6 +100,9 @@ func (c *MsfConsole) Read(ctx context.Context) (*ConsoleReadResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if responseResultFailure(result) {
+		return nil, fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
 
 	var readResult ConsoleReadResult
 	if err := decodeResult(result, &readResult); err != nil {
@@ -106,24 +116,45 @@ func (c *MsfConsole) Write(ctx context.Context, command string) error {
 	if !strings.HasSuffix(command, "\n") {
 		command += "\n"
 	}
-	_, err := c.rpc.Call(ctx, ConsoleWrite, c.CID, command)
-	return err
+	result, err := c.rpc.Call(ctx, ConsoleWrite, c.CID, command)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
+	return nil
 }
 
 func (c *MsfConsole) SessionKill(ctx context.Context) error {
-	_, err := c.rpc.Call(ctx, ConsoleSessionKill, c.CID)
-	return err
+	result, err := c.rpc.Call(ctx, ConsoleSessionKill, c.CID)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
+	return nil
 }
 
 func (c *MsfConsole) SessionDetach(ctx context.Context) error {
-	_, err := c.rpc.Call(ctx, ConsoleSessionDetach, c.CID)
-	return err
+	result, err := c.rpc.Call(ctx, ConsoleSessionDetach, c.CID)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
+	return nil
 }
 
 func (c *MsfConsole) Tabs(ctx context.Context, line string) ([]string, error) {
 	result, err := c.rpc.Call(ctx, ConsoleTabs, c.CID, line)
 	if err != nil {
 		return nil, err
+	}
+	if responseResultFailure(result) {
+		return nil, fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
 	}
 
 	return responseStringSlice(result, "tabs")

@@ -492,6 +492,18 @@ func optionalString(data map[string]interface{}, key string) string {
 	return value
 }
 
+// responseResultFailure reports whether an RPC result carries an explicit
+// {"result":"failure"} verdict. msfrpcd uses this form for console and
+// plugin operations instead of the error flag the rest of the API uses.
+func responseResultFailure(result interface{}) bool {
+	data, ok := result.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	res, _ := data["result"].(string)
+	return res == "failure"
+}
+
 func responseRPCError(result interface{}) (*RPCError, bool) {
 	data, ok := result.(map[string]interface{})
 	if !ok {
