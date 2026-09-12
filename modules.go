@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -397,8 +398,19 @@ func (m *Module) CompatiblePayloads(ctx context.Context) ([]string, error) {
 	return NewModuleManager(m.rpc).CompatiblePayloads(ctx, m.Name)
 }
 
+// fullName returns the module name with its type prefix. The
+// module.compatible_sessions RPC infers the module type from this prefix
+// instead of taking it as an argument, and treats an unprefixed name as a
+// post module.
+func (m *Module) fullName() string {
+	if strings.HasPrefix(m.Name, string(m.ModuleType)+"/") {
+		return m.Name
+	}
+	return string(m.ModuleType) + "/" + m.Name
+}
+
 func (m *Module) CompatibleSessions(ctx context.Context) ([]string, error) {
-	return NewModuleManager(m.rpc).CompatibleSessions(ctx, m.Name)
+	return NewModuleManager(m.rpc).CompatibleSessions(ctx, m.fullName())
 }
 
 func (m *Module) ExecuteWithPayload(ctx context.Context, payload *Module) (*ModuleExecuteResult, error) {

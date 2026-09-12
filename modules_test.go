@@ -297,3 +297,37 @@ func TestModuleManager_CompatibleSessionsAcceptsIntegerIDs(t *testing.T) {
 		t.Fatalf("unexpected sessions: %v", sessions)
 	}
 }
+
+func TestModule_CompatibleSessionsSendsFullPath(t *testing.T) {
+	var sentName interface{}
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleCompatibleSessions:
+				sentName = args[0]
+				return map[string]interface{}{"sessions": []interface{}{int64(1)}}, nil
+			case ModuleOptions:
+				return map[string]interface{}{}, nil
+			default:
+				return map[string]interface{}{"name": "fixture", "rank": "normal"}, nil
+			}
+		},
+	}
+
+	for _, name := range []string{
+		"linux/local/ptrace_traceme_pkexec_helper",
+		"exploit/linux/local/ptrace_traceme_pkexec_helper",
+	} {
+		sentName = nil
+		mod, err := NewModule(rpc, ExploitModuleType, name)
+		if err != nil {
+			t.Fatalf("NewModule(%q) failed: %v", name, err)
+		}
+		if _, err := mod.CompatibleSessions(context.Background()); err != nil {
+			t.Fatalf("CompatibleSessions(%q) failed: %v", name, err)
+		}
+		if got, _ := sentName.(string); got != "exploit/linux/local/ptrace_traceme_pkexec_helper" {
+			t.Fatalf("NewModule(%q): sent %q", name, got)
+		}
+	}
+}
