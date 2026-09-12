@@ -193,14 +193,18 @@ func TestEventMonitor_WatchedSessionOutput(t *testing.T) {
 	monitor.WatchSession("1")
 	monitor.WatchSession("2")
 
-	shellOut := waitForEvent(t, monitor.C(), EventSessionOutput)
-	if shellOut.SessionID != "1" || shellOut.Data != "whoami\n" {
-		t.Fatalf("expected shell output for session 1, got %+v", shellOut)
+	// Watched sessions are polled in map order, so the two outputs can
+	// arrive in either sequence.
+	outputs := make(map[string]string, 2)
+	for i := 0; i < 2; i++ {
+		event := waitForEvent(t, monitor.C(), EventSessionOutput)
+		outputs[event.SessionID] = event.Data
 	}
-
-	meterpreterOut := waitForEvent(t, monitor.C(), EventSessionOutput)
-	if meterpreterOut.SessionID != "2" || meterpreterOut.Data != "sysinfo\n" {
-		t.Fatalf("expected meterpreter output for session 2, got %+v", meterpreterOut)
+	if outputs["1"] != "whoami\n" {
+		t.Fatalf("expected shell output for session 1, got %v", outputs)
+	}
+	if outputs["2"] != "sysinfo\n" {
+		t.Fatalf("expected meterpreter output for session 2, got %v", outputs)
 	}
 }
 
