@@ -176,29 +176,15 @@ func (c *MsfConsole) IsBusy(ctx context.Context) (bool, error) {
 }
 
 // RunCommand writes command to the console and returns the output it
-// produces. Output already pending on the console (a fresh console still
-// holds its banner) is drained first, so the returned output belongs to
-// command alone. The command is complete once the console has been busy and
-// then reports idle; a command that never makes the console busy and
-// produces no output cannot be told apart from a queued command and runs
-// into the timeout. The timeout bounds the whole helper: draining, the
-// write, every read and every poll wait.
+// collects, including anything already pending on the console. Completion
+// requires the console to report busy at least once and then idle: an idle
+// read carrying stale output (a fresh console still holds its banner) is
+// not evidence the command ran. A command too short to ever be observed
+// busy therefore runs into the timeout. The timeout bounds the whole
+// helper: the write, every read and every poll wait.
 func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-
-	for {
-		result, err := c.Read(ctx)
-		if err != nil {
-			return "", commandTimeoutError(parent, ctx, command, err)
-		}
-		if !result.Busy {
-			break
-		}
-		if err := waitForPoll(ctx, c.pollInterval); err != nil {
-			return "", commandTimeoutError(parent, ctx, command, err)
-		}
-	}
 
 	if err := c.Write(ctx, command); err != nil {
 		return "", commandTimeoutError(parent, ctx, command, err)
@@ -214,7 +200,7 @@ func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout 
 		}
 		output += result.Data
 
-		started = started || result.Busy || result.Data != ""
+		started = started || result.Busy
 		if !result.Busy && started {
 			return output, nil
 		}

@@ -193,7 +193,7 @@ func TestConsoleWrappers_FailureResultReturnsConsoleNotFound(t *testing.T) {
 	}
 }
 
-func TestMsfConsole_RunCommandDrainsPendingOutput(t *testing.T) {
+func TestMsfConsole_RunCommandRequiresBusyBeforeIdle(t *testing.T) {
 	var reads int
 	rpc := fakeRPCCaller{
 		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
@@ -203,6 +203,8 @@ func TestMsfConsole_RunCommandDrainsPendingOutput(t *testing.T) {
 			reads++
 			switch reads {
 			case 1:
+				// Stale banner output on an idle console: the written
+				// command has not started yet.
 				return map[string]interface{}{"data": "banner output\n", "prompt": "msf > ", "busy": false}, nil
 			case 2:
 				return map[string]interface{}{"data": "", "prompt": "msf > ", "busy": true}, nil
@@ -218,9 +220,6 @@ func TestMsfConsole_RunCommandDrainsPendingOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunCommand failed: %v", err)
 	}
-	if strings.Contains(out, "banner") {
-		t.Errorf("pending banner output leaked into command output: %q", out)
-	}
 	if !strings.Contains(out, "command output") {
 		t.Errorf("missing command output: %q", out)
 	}
@@ -235,7 +234,7 @@ func TestMsfConsole_RunCommandCompletesWithoutFinalOutput(t *testing.T) {
 			}
 			reads++
 			switch reads {
-			case 2:
+			case 1:
 				return map[string]interface{}{"data": "command output\n", "busy": true}, nil
 			default:
 				return map[string]interface{}{"data": "", "busy": false}, nil
