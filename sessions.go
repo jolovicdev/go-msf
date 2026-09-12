@@ -3,6 +3,7 @@ package gomsf
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -58,7 +59,14 @@ func (m *SessionManager) Stop(ctx context.Context, sid string) error {
 }
 
 func (m *SessionManager) CompatibleModules(ctx context.Context, sid string) ([]string, error) {
-	result, err := m.rpc.Call(ctx, SessionCompatibleModules, sid)
+	// The server indexes sessions by integer ID and does not convert a
+	// string argument, so a string ID would silently match nothing.
+	id, err := strconv.Atoi(sid)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session id %q: %w", sid, err)
+	}
+
+	result, err := m.rpc.Call(ctx, SessionCompatibleModules, id)
 	if err != nil {
 		return nil, err
 	}

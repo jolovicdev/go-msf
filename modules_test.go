@@ -281,3 +281,19 @@ func TestNewModuleWithContext_FillsInfo(t *testing.T) {
 		t.Fatalf("expected module info to be filled, got %+v", mod.Info)
 	}
 }
+
+func TestModuleManager_CompatibleSessionsAcceptsIntegerIDs(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"sessions": []interface{}{int8(1), int64(2), "3"}}, nil
+		},
+	}
+
+	sessions, err := NewModuleManager(rpc).CompatibleSessions(context.Background(), "post/multi/manage/shell_to_meterpreter")
+	if err != nil {
+		t.Fatalf("CompatibleSessions failed: %v", err)
+	}
+	if len(sessions) != 3 || sessions[0] != "1" || sessions[1] != "2" || sessions[2] != "3" {
+		t.Fatalf("unexpected sessions: %v", sessions)
+	}
+}

@@ -532,6 +532,45 @@ func responseStringSlice(result interface{}, key string) ([]string, error) {
 	return values, nil
 }
 
+// responseIDSlice decodes a list of identifiers that msfrpcd sends as
+// integers (module.compatible_sessions returns integer session IDs),
+// normalizing them to the string form the library exposes.
+func responseIDSlice(result interface{}, key string) ([]string, error) {
+	data, err := responseMap(result)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, ok := data[key].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("%w: expected %s list", ErrUnexpectedResponse, key)
+	}
+
+	values := make([]string, len(raw))
+	for i, item := range raw {
+		value, ok := identifierToString(item)
+		if !ok {
+			return nil, fmt.Errorf("%w: expected %s[%d] identifier", ErrUnexpectedResponse, key, i)
+		}
+		values[i] = value
+	}
+
+	return values, nil
+}
+
+// identifierToString accepts a string or any of the integer widths msgpack
+// decoding can produce for a small number.
+func identifierToString(item interface{}) (string, bool) {
+	switch id := item.(type) {
+	case string:
+		return id, true
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%d", id), true
+	default:
+		return "", false
+	}
+}
+
 func responseString(data map[string]interface{}, key string) (string, error) {
 	value, ok := data[key].(string)
 	if !ok {

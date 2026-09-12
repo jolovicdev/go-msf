@@ -152,14 +152,15 @@ func (m *ModuleManager) CompatiblePayloads(ctx context.Context, name string) ([]
 
 // CompatibleSessions returns the sessions an exploit, auxiliary or post
 // module can run against. The RPC infers the module type from the name
-// prefix, so name must be the full module path.
+// prefix, so name must be the full module path. The server reports the
+// session IDs as integers.
 func (m *ModuleManager) CompatibleSessions(ctx context.Context, name string) ([]string, error) {
 	result, err := m.rpc.Call(ctx, ModuleCompatibleSessions, name)
 	if err != nil {
 		return nil, err
 	}
 
-	return responseStringSlice(result, "sessions")
+	return responseIDSlice(result, "sessions")
 }
 
 func (m *ModuleManager) Execute(ctx context.Context, modType ModuleType, name string, options map[string]interface{}) (*ModuleExecuteResult, error) {

@@ -128,3 +128,30 @@ func TestRunWithOutput_CallerCancellationPassesThrough(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestSessionManager_CompatibleModulesSendsIntegerID(t *testing.T) {
+	var sentID interface{}
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method == SessionCompatibleModules {
+				sentID = args[0]
+			}
+			return map[string]interface{}{"modules": []interface{}{"post/multi/manage/shell_to_meterpreter"}}, nil
+		},
+	}
+
+	mods, err := NewSessionManager(rpc).CompatibleModules(context.Background(), "2")
+	if err != nil {
+		t.Fatalf("CompatibleModules failed: %v", err)
+	}
+	if len(mods) != 1 {
+		t.Fatalf("unexpected modules: %v", mods)
+	}
+	if id, ok := sentID.(int); !ok || id != 2 {
+		t.Fatalf("expected integer session id 2, got %#v", sentID)
+	}
+
+	if _, err := NewSessionManager(rpc).CompatibleModules(context.Background(), "not-a-number"); err == nil {
+		t.Fatal("expected error for non-numeric session id")
+	}
+}
