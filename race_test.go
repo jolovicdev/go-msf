@@ -136,3 +136,52 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestConcurrent_ModuleOptionAccess(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleOptions:
+				return map[string]interface{}{
+					"RHOSTS": map[string]interface{}{"type": "string", "required": true},
+				}, nil
+			default:
+				return map[string]interface{}{"name": "fixture", "rank": "normal"}, nil
+			}
+		},
+	}
+
+	mod, err := NewModule(rpc, AuxiliaryModuleType, "scanner/portscan/tcp")
+	if err != nil {
+		t.Fatalf("NewModule failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if err := mod.SetOption("RHOSTS", "127.0.0.1"); err != nil {
+				t.Errorf("SetOption failed: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if _, err := mod.GetOption("RHOSTS"); err != nil {
+				t.Errorf("GetOption failed: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			mod.RunOptions()
+			mod.MissingRequired()
+		}
+	}()
+	wg.Wait()
+}

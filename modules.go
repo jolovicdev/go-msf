@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 type ModuleManager struct {
@@ -182,6 +183,10 @@ type Module struct {
 	Info       *MsfModuleInfo
 	options    map[string]*MsfModuleOption
 	runOptions map[string]interface{}
+
+	// mu guards runOptions; the registered option metadata is immutable
+	// once the module is constructed.
+	mu sync.RWMutex
 }
 
 func NewModule(rpc RPCCaller, modType ModuleType, name string) (*Module, error) {
@@ -309,6 +314,8 @@ func (m *Module) RequiredOptions() []string {
 
 func (m *Module) MissingRequired() []string {
 	var missing []string
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for k, v := range m.options {
 		if v.Required {
 			if _, ok := m.runOptions[k]; !ok {
@@ -331,6 +338,8 @@ func (m *Module) GetOption(option string) (interface{}, error) {
 	if _, ok := m.options[option]; !ok {
 		return nil, invalidOptionError(option)
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.runOptions[option], nil
 }
 
@@ -353,11 +362,15 @@ func (m *Module) SetOption(option string, value interface{}) error {
 		}
 	}
 
+	m.mu.Lock()
 	m.runOptions[option] = value
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *Module) RunOptions() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	result := make(map[string]interface{}, len(m.runOptions))
 	for k, v := range m.runOptions {
 		result[k] = v
@@ -366,7 +379,7 @@ func (m *Module) RunOptions() map[string]interface{} {
 }
 
 func (m *Module) Execute(ctx context.Context) (*ModuleExecuteResult, error) {
-	return NewModuleManager(m.rpc).Execute(ctx, m.ModuleType, m.Name, m.runOptions)
+	return NewModuleManager(m.rpc).Execute(ctx, m.ModuleType, m.Name, m.RunOptions())
 }
 
 // Targets returns the exploit's target list, captured when the module was
