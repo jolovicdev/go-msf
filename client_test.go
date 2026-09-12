@@ -254,6 +254,32 @@ func TestClientWithToken_NoReauthWithoutPassword(t *testing.T) {
 	}
 }
 
+func TestClientCall_HTTPErrorStatusReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	if _, err := client.Call(context.Background(), CoreVersion); err == nil {
+		t.Fatal("expected error for non-200 response, got nil")
+	}
+}
+
 func TestClientCall_RejectsOversizedMap(t *testing.T) {
 	// map32 header claiming ~4 billion entries followed by no data.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

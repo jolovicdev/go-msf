@@ -201,6 +201,13 @@ func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	}
 	defer resp.Body.Close()
 
+	// msfrpcd answers RPC calls with 200, even for RPC-level errors. Any
+	// other status carries a non-msgpack body (proxy or gateway errors),
+	// whose first byte would decode as a bogus result.
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed: http status %d", resp.StatusCode)
+	}
+
 	// msfrpcd encodes strings as binary and some maps (module.info targets)
 	// with integer keys, so decode maps with tolerant keys and normalize
 	// afterwards. The decoder trusts the server the same way the caller does:
