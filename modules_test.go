@@ -3,6 +3,7 @@ package gomsf
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -279,5 +280,121 @@ func TestNewModuleWithContext_FillsInfo(t *testing.T) {
 
 	if mod.Info == nil || mod.Info.Name != "TCP Port Scanner" || mod.Info.Rank != "normal" {
 		t.Fatalf("expected module info to be filled, got %+v", mod.Info)
+	}
+}
+
+func TestModuleManager_CompatibleSessionsAcceptsIntegerIDs(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"sessions": []interface{}{int8(1), int64(2), "3"}}, nil
+		},
+	}
+
+	sessions, err := NewModuleManager(rpc).CompatibleSessions(context.Background(), "post/multi/manage/shell_to_meterpreter")
+	if err != nil {
+		t.Fatalf("CompatibleSessions failed: %v", err)
+	}
+	if len(sessions) != 3 || sessions[0] != "1" || sessions[1] != "2" || sessions[2] != "3" {
+		t.Fatalf("unexpected sessions: %v", sessions)
+	}
+}
+
+func TestModule_CompatibleSessionsSendsFullPath(t *testing.T) {
+	var sentName interface{}
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleCompatibleSessions:
+				sentName = args[0]
+				return map[string]interface{}{"sessions": []interface{}{int64(1)}}, nil
+			case ModuleOptions:
+				return map[string]interface{}{}, nil
+			default:
+				return map[string]interface{}{"name": "fixture", "rank": "normal"}, nil
+			}
+		},
+	}
+
+	for _, name := range []string{
+		"linux/local/ptrace_traceme_pkexec_helper",
+		"exploit/linux/local/ptrace_traceme_pkexec_helper",
+	} {
+		sentName = nil
+		mod, err := NewModule(rpc, ExploitModuleType, name)
+		if err != nil {
+			t.Fatalf("NewModule(%q) failed: %v", name, err)
+		}
+		if _, err := mod.CompatibleSessions(context.Background()); err != nil {
+			t.Fatalf("CompatibleSessions(%q) failed: %v", name, err)
+		}
+		if got, _ := sentName.(string); got != "exploit/linux/local/ptrace_traceme_pkexec_helper" {
+			t.Fatalf("NewModule(%q): sent %q", name, got)
+		}
+	}
+}
+
+func TestModuleManager_ExecuteDecodesPayloadResult(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"payload": "printf review"}, nil
+		},
+	}
+
+	result, err := NewModuleManager(rpc).Execute(context.Background(), PayloadModuleType, "cmd/unix/generic", map[string]interface{}{"CMD": "printf review"})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.Payload != "printf review" {
+		t.Fatalf("expected generated payload, got %+v", result)
+	}
+}
+
+func TestModule_ExecutionOptions(t *testing.T) {
+	mod := &Module{
+		options:    map[string]*MsfModuleOption{},
+		runOptions: make(map[string]interface{}),
+	}
+
+	if err := mod.SetOption("TARGET", 1); err != nil {
+		t.Errorf("SetOption(TARGET) failed: %v", err)
+	}
+	if err := mod.SetOption("PAYLOAD", "windows/meterpreter/reverse_tcp"); err != nil {
+		t.Errorf("SetOption(PAYLOAD) failed: %v", err)
+	}
+	if v, err := mod.GetOption("TARGET"); err != nil || v != 1 {
+		t.Errorf("GetOption(TARGET) = %v, %v", v, err)
+	}
+	if err := mod.SetOption("NOT_AN_OPTION", true); !errors.Is(err, ErrInvalidOption) {
+		t.Errorf("unknown option: expected ErrInvalidOption, got %v", err)
+	}
+}
+
+func TestModule_MissingRequiredRejectsUnusableValues(t *testing.T) {
+	mod := &Module{
+		options: map[string]*MsfModuleOption{
+			"RHOSTS":  {Type: "string", Required: true},
+			"THREADS": {Type: "integer", Required: true},
+		},
+		runOptions: map[string]interface{}{"THREADS": 0},
+	}
+
+	if missing := mod.MissingRequired(); !slices.Contains(missing, "RHOSTS") || slices.Contains(missing, "THREADS") {
+		t.Fatalf("expected only RHOSTS missing, got %v", missing)
+	}
+
+	for _, value := range []interface{}{"", nil} {
+		if err := mod.SetOption("RHOSTS", value); err != nil {
+			t.Fatalf("SetOption(RHOSTS, %v) failed: %v", value, err)
+		}
+		if missing := mod.MissingRequired(); !slices.Contains(missing, "RHOSTS") {
+			t.Fatalf("RHOSTS=%v should stay missing, got %v", value, missing)
+		}
+	}
+
+	if err := mod.SetOption("RHOSTS", "127.0.0.1"); err != nil {
+		t.Fatalf("SetOption(RHOSTS, host) failed: %v", err)
+	}
+	if missing := mod.MissingRequired(); slices.Contains(missing, "RHOSTS") {
+		t.Fatalf("RHOSTS set but still reported missing: %v", missing)
 	}
 }

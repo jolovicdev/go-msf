@@ -18,3 +18,19 @@ func TestPluginManager_List(t *testing.T) {
 		t.Error("Expected plugins to be non-nil")
 	}
 }
+
+func TestPluginManager_FailureResultReturnsError(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"result": "failure"}, nil
+		},
+	}
+
+	if err := NewPluginManager(rpc).Load(context.Background(), "nonexistent"); err == nil {
+		t.Error("Expected load failure to return an error")
+	}
+
+	if err := NewPluginManager(rpc).Unload(context.Background(), "nonexistent"); err == nil {
+		t.Error("Expected unload failure to return an error")
+	}
+}

@@ -2,6 +2,7 @@ package gomsf
 
 import (
 	"context"
+	"fmt"
 )
 
 type PluginManager struct {
@@ -22,11 +23,23 @@ func (m *PluginManager) List(ctx context.Context) ([]string, error) {
 }
 
 func (m *PluginManager) Load(ctx context.Context, plugin string) error {
-	_, err := m.rpc.Call(ctx, PluginLoad, plugin)
-	return err
+	result, err := m.rpc.Call(ctx, PluginLoad, plugin)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("failed to load plugin %s", plugin)
+	}
+	return nil
 }
 
 func (m *PluginManager) Unload(ctx context.Context, plugin string) error {
-	_, err := m.rpc.Call(ctx, PluginUnload, plugin)
-	return err
+	result, err := m.rpc.Call(ctx, PluginUnload, plugin)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("failed to unload plugin %s", plugin)
+	}
+	return nil
 }

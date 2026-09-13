@@ -2,6 +2,8 @@ package gomsf
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -158,5 +160,192 @@ func TestMsfConsole_Tabs(t *testing.T) {
 
 	if tabs == nil {
 		t.Log("Tabs returned nil (this may be OK)")
+	}
+}
+
+func TestConsoleWrappers_FailureResultReturnsConsoleNotFound(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			return map[string]interface{}{"result": "failure"}, nil
+		},
+	}
+
+	ctx := context.Background()
+	con := NewMsfConsole(rpc, "999999")
+
+	if _, err := con.Read(ctx); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Read: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := con.Write(ctx, "version"); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Write: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := con.SessionKill(ctx); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("SessionKill: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := con.SessionDetach(ctx); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("SessionDetach: expected ErrConsoleNotFound, got %v", err)
+	}
+	if _, err := con.Tabs(ctx, "ver"); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Tabs: expected ErrConsoleNotFound, got %v", err)
+	}
+	if err := NewConsoleManager(rpc).Destroy(ctx, "999999"); !errors.Is(err, ErrConsoleNotFound) {
+		t.Errorf("Destroy: expected ErrConsoleNotFound, got %v", err)
+	}
+}
+
+func TestMsfConsole_RunCommandDoesNotCompleteOnStaleIdleOutput(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			switch reads {
+			case 1:
+				// Stale banner output on an idle console: the written
+				// command has not started yet.
+				return map[string]interface{}{"data": "banner output\n", "prompt": "msf > ", "busy": false}, nil
+			case 2:
+				return map[string]interface{}{"data": "", "prompt": "msf > ", "busy": true}, nil
+			case 3:
+				return map[string]interface{}{"data": "command output\n", "prompt": "msf > ", "busy": false}, nil
+			default:
+				return map[string]interface{}{"data": "", "prompt": "msf > ", "busy": false}, nil
+			}
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if !strings.Contains(out, "command output") {
+		t.Errorf("missing command output: %q", out)
+	}
+}
+
+func TestMsfConsole_RunCommandCompletesFastCommandWithoutBusy(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			if reads == 1 {
+				return map[string]interface{}{"data": "", "busy": false}, nil
+			}
+			return map[string]interface{}{"data": "command output\n", "busy": false}, nil
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if out != "command output\n" {
+		t.Errorf("unexpected output: %q", out)
+	}
+}
+
+func TestMsfConsole_RunCommandCompletesWithoutFinalOutput(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			switch reads {
+			case 1:
+				return map[string]interface{}{"data": "command output\n", "busy": true}, nil
+			default:
+				return map[string]interface{}{"data": "", "busy": false}, nil
+			}
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if out != "command output\n" {
+		t.Errorf("unexpected output: %q", out)
+	}
+}
+
+func TestMsfConsole_RunCommandTimeoutBoundsReads(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method == ConsoleRead {
+				select {
+				case <-time.After(120 * time.Millisecond):
+					return map[string]interface{}{"data": "DONE", "busy": false}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return map[string]interface{}{}, nil
+		},
+	}
+
+	start := time.Now()
+	_, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 20*time.Millisecond)
+	if !errors.Is(err, ErrCommandTimeout) {
+		t.Fatalf("expected ErrCommandTimeout, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("20ms timeout took %s", elapsed)
+	}
+}
+
+func TestMsfConsole_RunCommandCompletesFastFirstRead(t *testing.T) {
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method == ConsoleRead {
+				return map[string]interface{}{"data": "Framework: 6.5\n", "busy": false}, nil
+			}
+			return map[string]interface{}{}, nil
+		},
+	}
+
+	start := time.Now()
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("completed command timed out after %s: %v (output %q)", time.Since(start), err, out)
+	}
+	if !strings.Contains(out, "Framework:") {
+		t.Fatalf("missing command output: %q", out)
+	}
+}
+
+func TestMsfConsole_RunCommandCollectsFinalOutputAfterIdle(t *testing.T) {
+	var reads int
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			if method != ConsoleRead {
+				return map[string]interface{}{}, nil
+			}
+			reads++
+			switch reads {
+			case 1:
+				return map[string]interface{}{"data": "", "busy": true}, nil
+			case 2:
+				return map[string]interface{}{"data": "", "busy": false}, nil
+			case 3:
+				return map[string]interface{}{"data": "Framework: 6.5\n", "busy": false}, nil
+			default:
+				return map[string]interface{}{"data": "", "busy": false}, nil
+			}
+		},
+	}
+
+	out, err := NewMsfConsole(rpc, "1").RunCommand(context.Background(), "version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("RunCommand failed: %v", err)
+	}
+	if out != "Framework: 6.5\n" {
+		t.Fatalf("final output after idle dropped: %q", out)
 	}
 }

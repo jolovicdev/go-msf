@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -254,6 +256,32 @@ func TestClientWithToken_NoReauthWithoutPassword(t *testing.T) {
 	}
 }
 
+func TestClientCall_HTTPErrorStatusReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	if _, err := client.Call(context.Background(), CoreVersion); err == nil {
+		t.Fatal("expected error for non-200 response, got nil")
+	}
+}
+
 func TestClientCall_RejectsOversizedMap(t *testing.T) {
 	// map32 header claiming ~4 billion entries followed by no data.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -318,5 +346,215 @@ func TestClientCall_RejectsDuplicateNormalizedKeys(t *testing.T) {
 	_, err = client.Call(context.Background(), CoreVersion)
 	if err == nil || !strings.Contains(err.Error(), "duplicate map key") {
 		t.Fatalf("expected duplicate key error, got %v", err)
+	}
+}
+
+// blockingReauthServer delays the second auth.login until the test releases
+// it, so a logout can be interleaved with an in-flight re-authentication.
+type blockingReauthServer struct {
+	loginStarted chan struct{}
+	releaseLogin chan struct{}
+	logins       atomic.Int32
+}
+
+func (s *blockingReauthServer) handle(w http.ResponseWriter, r *http.Request) {
+	var req []interface{}
+	if err := msgpack.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var response interface{}
+	switch req[0] {
+	case "auth.login":
+		if s.logins.Add(1) == 2 {
+			close(s.loginStarted)
+			<-s.releaseLogin
+		}
+		response = map[string]interface{}{
+			"result": "success",
+			"token":  "fixture-token-" + strconv.Itoa(int(s.logins.Load())),
+		}
+	case "core.version":
+		if req[1] == "fixture-token-1" {
+			response = map[string]interface{}{"error": true, "error_message": "Invalid Token"}
+		} else {
+			response = map[string]interface{}{"version": "6.5"}
+		}
+	case "auth.logout":
+		response = map[string]interface{}{"result": "success"}
+	default:
+		response = map[string]interface{}{}
+	}
+	_ = msgpack.NewEncoder(w).Encode(response)
+}
+
+func newBlockingReauthClient(t *testing.T, server *blockingReauthServer) *Client {
+	t.Helper()
+
+	ts := httptest.NewServer(http.HandlerFunc(server.handle))
+	t.Cleanup(ts.Close)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClient("password",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	t.Cleanup(func() { client.Logout(context.Background()) })
+
+	return client
+}
+
+func TestClientCall_LogoutDuringReauthKeepsLoggedOutState(t *testing.T) {
+	server := &blockingReauthServer{
+		loginStarted: make(chan struct{}),
+		releaseLogin: make(chan struct{}),
+	}
+	client := newBlockingReauthClient(t, server)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Core().Version(context.Background())
+		done <- err
+	}()
+
+	<-server.loginStarted
+	if err := client.Logout(context.Background()); err != nil {
+		t.Fatalf("Logout failed: %v", err)
+	}
+	close(server.releaseLogin)
+
+	if err := <-done; err != nil {
+		t.Fatalf("retrying call failed: %v", err)
+	}
+	if client.IsAuthenticated() {
+		t.Error("client is authenticated again after Logout")
+	}
+}
+
+func TestClientCall_ReauthWaitHonorsContext(t *testing.T) {
+	server := &blockingReauthServer{
+		loginStarted: make(chan struct{}),
+		releaseLogin: make(chan struct{}),
+	}
+	client := newBlockingReauthClient(t, server)
+
+	firstDone := make(chan struct{})
+	go func() {
+		client.Core().Version(context.Background())
+		close(firstDone)
+	}()
+	<-server.loginStarted
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(server.releaseLogin)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := client.Core().Version(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context deadline, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("waited %s behind in-flight login", elapsed)
+	}
+
+	<-firstDone
+}
+
+func TestClientCall_RPCErrorClassComesFromErrorClass(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = msgpack.NewEncoder(w).Encode(map[string]interface{}{
+			"error":         true,
+			"error_class":   "ArgumentError",
+			"error_string":  "wrong number of arguments",
+			"error_message": "wrong number of arguments",
+		})
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	_, err = client.Call(context.Background(), CoreVersion)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("expected *RPCError, got %v", err)
+	}
+	if rpcErr.Class != "ArgumentError" {
+		t.Fatalf("expected class ArgumentError, got %q", rpcErr.Class)
+	}
+}
+
+func TestClientCall_HTTPErrorPreservesCallerCancellation(t *testing.T) {
+	headersSent := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.(http.Flusher).Flush()
+		close(headersSent)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse url failed: %v", err)
+	}
+
+	client, err := NewClientWithToken("token",
+		WithHost(u.Hostname()),
+		WithPort(mustPort(t, u)),
+		WithURI("/"),
+		WithSSL(false),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithToken failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Call(ctx, CoreVersion)
+		done <- err
+	}()
+
+	<-headersSent
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lost caller cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("call did not return after cancellation")
 	}
 }

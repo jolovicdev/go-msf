@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 )
 
 type ModuleManager struct {
@@ -151,14 +153,15 @@ func (m *ModuleManager) CompatiblePayloads(ctx context.Context, name string) ([]
 
 // CompatibleSessions returns the sessions an exploit, auxiliary or post
 // module can run against. The RPC infers the module type from the name
-// prefix, so name must be the full module path.
+// prefix, so name must be the full module path. The server reports the
+// session IDs as integers.
 func (m *ModuleManager) CompatibleSessions(ctx context.Context, name string) ([]string, error) {
 	result, err := m.rpc.Call(ctx, ModuleCompatibleSessions, name)
 	if err != nil {
 		return nil, err
 	}
 
-	return responseStringSlice(result, "sessions")
+	return responseIDSlice(result, "sessions")
 }
 
 func (m *ModuleManager) Execute(ctx context.Context, modType ModuleType, name string, options map[string]interface{}) (*ModuleExecuteResult, error) {
@@ -182,6 +185,10 @@ type Module struct {
 	Info       *MsfModuleInfo
 	options    map[string]*MsfModuleOption
 	runOptions map[string]interface{}
+
+	// mu guards runOptions; the registered option metadata is immutable
+	// once the module is constructed.
+	mu sync.RWMutex
 }
 
 func NewModule(rpc RPCCaller, modType ModuleType, name string) (*Module, error) {
@@ -309,14 +316,33 @@ func (m *Module) RequiredOptions() []string {
 
 func (m *Module) MissingRequired() []string {
 	var missing []string
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for k, v := range m.options {
-		if v.Required {
-			if _, ok := m.runOptions[k]; !ok {
-				missing = append(missing, k)
-			}
+		if v.Required && !usableOptionValue(m.runOptions[k]) {
+			missing = append(missing, k)
 		}
 	}
 	return missing
+}
+
+// usableOptionValue reports whether a required option value can be used:
+// nil and empty strings carry no configuration and empty slices carry no
+// entries, while false and zero are valid values for bool and integer
+// options.
+func usableOptionValue(value interface{}) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return v != ""
+	case []interface{}:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	default:
+		return true
+	}
 }
 
 func (m *Module) OptionInfo(option string) (*MsfModuleOption, error) {
@@ -328,19 +354,21 @@ func (m *Module) OptionInfo(option string) (*MsfModuleOption, error) {
 }
 
 func (m *Module) GetOption(option string) (interface{}, error) {
-	if _, ok := m.options[option]; !ok {
+	if _, ok := m.options[option]; !ok && !isExecutionOption(option) {
 		return nil, invalidOptionError(option)
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.runOptions[option], nil
 }
 
 func (m *Module) SetOption(option string, value interface{}) error {
 	opt, ok := m.options[option]
-	if !ok {
+	if !ok && !isExecutionOption(option) {
 		return invalidOptionError(option)
 	}
 
-	if len(opt.Enums) > 0 {
+	if ok && len(opt.Enums) > 0 {
 		found := false
 		for _, e := range opt.Enums {
 			if e == value {
@@ -353,11 +381,22 @@ func (m *Module) SetOption(option string, value interface{}) error {
 		}
 	}
 
+	m.mu.Lock()
 	m.runOptions[option] = value
+	m.mu.Unlock()
 	return nil
 }
 
+// isExecutionOption reports whether option selects how the module runs
+// rather than configuring a registered option: TARGET and PAYLOAD are
+// missing from the module.options response.
+func isExecutionOption(option string) bool {
+	return option == "TARGET" || option == "PAYLOAD"
+}
+
 func (m *Module) RunOptions() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	result := make(map[string]interface{}, len(m.runOptions))
 	for k, v := range m.runOptions {
 		result[k] = v
@@ -366,7 +405,7 @@ func (m *Module) RunOptions() map[string]interface{} {
 }
 
 func (m *Module) Execute(ctx context.Context) (*ModuleExecuteResult, error) {
-	return NewModuleManager(m.rpc).Execute(ctx, m.ModuleType, m.Name, m.runOptions)
+	return NewModuleManager(m.rpc).Execute(ctx, m.ModuleType, m.Name, m.RunOptions())
 }
 
 // Targets returns the exploit's target list, captured when the module was
@@ -383,8 +422,19 @@ func (m *Module) CompatiblePayloads(ctx context.Context) ([]string, error) {
 	return NewModuleManager(m.rpc).CompatiblePayloads(ctx, m.Name)
 }
 
+// fullName returns the module name with its type prefix. The
+// module.compatible_sessions RPC infers the module type from this prefix
+// instead of taking it as an argument, and treats an unprefixed name as a
+// post module.
+func (m *Module) fullName() string {
+	if strings.HasPrefix(m.Name, string(m.ModuleType)+"/") {
+		return m.Name
+	}
+	return string(m.ModuleType) + "/" + m.Name
+}
+
 func (m *Module) CompatibleSessions(ctx context.Context) ([]string, error) {
-	return NewModuleManager(m.rpc).CompatibleSessions(ctx, m.Name)
+	return NewModuleManager(m.rpc).CompatibleSessions(ctx, m.fullName())
 }
 
 func (m *Module) ExecuteWithPayload(ctx context.Context, payload *Module) (*ModuleExecuteResult, error) {

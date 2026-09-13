@@ -22,8 +22,10 @@ type Client struct {
 	username            string
 	password            string
 	token               string
+	authGeneration      uint64
 	tokenMu             sync.RWMutex
 	reauthMu            sync.Mutex
+	reauthWait          chan struct{}
 	client              *http.Client
 	consolePollInterval time.Duration
 	sessionPollInterval time.Duration
@@ -105,11 +107,15 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 		}
 	}
 
-	if err := c.login(context.Background(), c.username, password); err != nil {
+	token, err := c.login(context.Background(), c.username, password)
+	if err != nil {
 		return nil, err
 	}
 
+	c.tokenMu.Lock()
+	c.token = token
 	c.password = password
+	c.tokenMu.Unlock()
 
 	return c, nil
 }
@@ -158,18 +164,21 @@ func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interfac
 		return result, err
 	}
 
-	if err := c.reloginIfStale(ctx, failedToken); err != nil {
+	token, err := c.reloginIfStale(ctx, failedToken)
+	if err != nil {
 		return nil, err
 	}
 
-	return c.call(ctx, method, args...)
+	return c.callWithToken(ctx, token, method, args...)
 }
 
 func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
-	c.tokenMu.RLock()
-	token := c.token
-	c.tokenMu.RUnlock()
+	return c.callWithToken(ctx, c.Token(), method, args...)
+}
 
+// callWithToken performs the RPC round trip authenticated with token. Every
+// method except auth.login requires one.
+func (c *Client) callWithToken(ctx context.Context, token string, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
 	if method != AuthLogin && token == "" {
 		return nil, ErrNotAuthenticated
 	}
@@ -212,43 +221,54 @@ func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interfac
 
 	var result interface{}
 	if err := decoder.Decode(&result); err != nil {
+		if resp.StatusCode != http.StatusOK {
+			// Wrap so a decode failure caused by the caller's cancellation
+			// still matches errors.Is(err, context.Canceled).
+			return nil, fmt.Errorf("request failed: http status %d: %w", resp.StatusCode, err)
+		}
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	result = convertBytesToString(result)
 
+	// msfrpcd reports server exceptions as a non-200 response whose body is
+	// still the structured error; those are RPC errors, not transport
+	// failures. Any other non-200 body (a proxy or gateway error page) is
+	// not a msgpack result and must not be returned as one.
 	if rpcErr, ok := responseRPCError(result); ok {
 		return nil, rpcErr
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed: http status %d", resp.StatusCode)
 	}
 
 	return result, nil
 }
 
-func (c *Client) login(ctx context.Context, username, password string) error {
+// login performs auth.login and returns the fresh token without storing it;
+// callers decide whether the client keeps the session.
+func (c *Client) login(ctx context.Context, username, password string) (string, error) {
 	result, err := c.Call(ctx, AuthLogin, username, password)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	m, ok := result.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("%w: expected auth result map", ErrUnexpectedResponse)
+		return "", fmt.Errorf("%w: expected auth result map", ErrUnexpectedResponse)
 	}
 
 	if res, ok := m["result"].(string); !ok || res != "success" {
-		return fmt.Errorf("authentication failed")
+		return "", fmt.Errorf("authentication failed")
 	}
 
 	token, ok := m["token"].(string)
 	if !ok {
-		return fmt.Errorf("%w: missing auth token", ErrUnexpectedResponse)
+		return "", fmt.Errorf("%w: missing auth token", ErrUnexpectedResponse)
 	}
 
-	c.tokenMu.Lock()
-	c.token = token
-	c.tokenMu.Unlock()
-
-	return nil
+	return token, nil
 }
 
 func (c *Client) Logout(ctx context.Context) error {
@@ -267,9 +287,12 @@ func (c *Client) Logout(ctx context.Context) error {
 		return err
 	}
 
+	// Bumping the generation rejects login results from callers that were
+	// already re-authenticating when the logout happened.
 	c.tokenMu.Lock()
 	c.token = ""
 	c.password = ""
+	c.authGeneration++
 	c.tokenMu.Unlock()
 
 	return nil
@@ -293,19 +316,62 @@ func (c *Client) IsAuthenticated() bool {
 	return c.token != ""
 }
 
-func (c *Client) reloginIfStale(ctx context.Context, failedToken string) error {
-	c.reauthMu.Lock()
-	defer c.reauthMu.Unlock()
+// reloginIfStale re-authenticates a client whose token the server rejected
+// and returns the token the caller should retry with. Only one login runs at
+// a time; concurrent callers wait for it and reuse its result, and the wait
+// honors ctx. A login that completes after Logout does not restore the
+// session: the fresh token is handed to the retrying caller only.
+func (c *Client) reloginIfStale(ctx context.Context, failedToken string) (string, error) {
+	for {
+		c.reauthMu.Lock()
+		if c.reauthWait == nil {
+			wait := make(chan struct{})
+			c.reauthWait = wait
+			c.reauthMu.Unlock()
 
-	if c.Token() != failedToken {
-		return nil
+			defer func() {
+				c.reauthMu.Lock()
+				c.reauthWait = nil
+				c.reauthMu.Unlock()
+				close(wait)
+			}()
+
+			if token := c.Token(); token != failedToken {
+				return token, nil
+			}
+
+			c.tokenMu.RLock()
+			generation := c.authGeneration
+			password := c.password
+			c.tokenMu.RUnlock()
+
+			token, err := c.login(ctx, c.username, password)
+			if err != nil {
+				return "", err
+			}
+
+			c.tokenMu.Lock()
+			if c.authGeneration == generation {
+				c.token = token
+			}
+			c.tokenMu.Unlock()
+
+			return token, nil
+		}
+
+		wait := c.reauthWait
+		c.reauthMu.Unlock()
+
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+
+		if token := c.Token(); token != failedToken {
+			return token, nil
+		}
 	}
-
-	c.tokenMu.RLock()
-	password := c.password
-	c.tokenMu.RUnlock()
-
-	return c.login(ctx, c.username, password)
 }
 
 func isInvalidTokenError(err error) bool {
@@ -472,6 +538,45 @@ func responseStringSlice(result interface{}, key string) ([]string, error) {
 	return values, nil
 }
 
+// responseIDSlice decodes a list of identifiers that msfrpcd sends as
+// integers (module.compatible_sessions returns integer session IDs),
+// normalizing them to the string form the library exposes.
+func responseIDSlice(result interface{}, key string) ([]string, error) {
+	data, err := responseMap(result)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, ok := data[key].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("%w: expected %s list", ErrUnexpectedResponse, key)
+	}
+
+	values := make([]string, len(raw))
+	for i, item := range raw {
+		value, ok := identifierToString(item)
+		if !ok {
+			return nil, fmt.Errorf("%w: expected %s[%d] identifier", ErrUnexpectedResponse, key, i)
+		}
+		values[i] = value
+	}
+
+	return values, nil
+}
+
+// identifierToString accepts a string or any of the integer widths msgpack
+// decoding can produce for a small number.
+func identifierToString(item interface{}) (string, bool) {
+	switch id := item.(type) {
+	case string:
+		return id, true
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%d", id), true
+	default:
+		return "", false
+	}
+}
+
 func responseString(data map[string]interface{}, key string) (string, error) {
 	value, ok := data[key].(string)
 	if !ok {
@@ -483,6 +588,18 @@ func responseString(data map[string]interface{}, key string) (string, error) {
 func optionalString(data map[string]interface{}, key string) string {
 	value, _ := data[key].(string)
 	return value
+}
+
+// responseResultFailure reports whether an RPC result carries an explicit
+// {"result":"failure"} verdict. msfrpcd uses this form for console and
+// plugin operations instead of the error flag the rest of the API uses.
+func responseResultFailure(result interface{}) bool {
+	data, ok := result.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	res, _ := data["result"].(string)
+	return res == "failure"
 }
 
 func responseRPCError(result interface{}) (*RPCError, bool) {
@@ -497,7 +614,7 @@ func responseRPCError(result interface{}) (*RPCError, bool) {
 	}
 
 	message, _ := data["error_message"].(string)
-	class, _ := data["error_string"].(string)
+	class, _ := data["error_class"].(string)
 
 	return &RPCError{
 		Class:   class,
@@ -537,4 +654,14 @@ func waitForPoll(ctx context.Context, interval time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// commandTimeoutError maps errors raised by a command helper's own deadline
+// onto ErrCommandTimeout. Cancellation of the caller's context and unrelated
+// RPC failures pass through unchanged.
+func commandTimeoutError(parent, cmd context.Context, command string, err error) error {
+	if parent.Err() == nil && cmd.Err() != nil {
+		return fmt.Errorf("%w: %s", ErrCommandTimeout, command)
+	}
+	return err
 }

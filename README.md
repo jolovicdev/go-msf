@@ -3,7 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/jolovicdev/go-msf/v2.svg)](https://pkg.go.dev/github.com/jolovicdev/go-msf/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/jolovicdev/go-msf)](https://goreportcard.com/report/github.com/jolovicdev/go-msf)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-v2.0.1-blue.svg)](https://github.com/jolovicdev/go-msf/releases)
+[![Version](https://img.shields.io/badge/version-v2.1.0-blue.svg)](https://github.com/jolovicdev/go-msf/releases)
 
 > Production-ready Go client for the Metasploit Framework RPC API. Automate penetration testing, security research, and red team operations with type-safe Go.
 
@@ -30,7 +30,7 @@ Requires Go 1.26 or later.
 
 ## Version
 
-**v2.0.1** — See [releases](https://github.com/jolovicdev/go-msf/releases) for changes. Versioning follows [Semantic Versioning](https://semver.org/).
+**v2.1.0** — See [releases](https://github.com/jolovicdev/go-msf/releases) for changes. Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## Quick Start
 

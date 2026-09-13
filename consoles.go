@@ -65,8 +65,15 @@ func (m *ConsoleManager) Create(ctx context.Context) (*Console, error) {
 }
 
 func (m *ConsoleManager) Destroy(ctx context.Context, cid string) error {
-	_, err := m.rpc.Call(ctx, ConsoleDestroy, cid)
-	return err
+	result, err := m.rpc.Call(ctx, ConsoleDestroy, cid)
+	if err != nil {
+		return err
+	}
+	// An unknown console ID is reported as {"result":"failure"}.
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, cid)
+	}
+	return nil
 }
 
 func (m *ConsoleManager) GetConsole(ctx context.Context, cid string) (*MsfConsole, error) {
@@ -93,6 +100,9 @@ func (c *MsfConsole) Read(ctx context.Context) (*ConsoleReadResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if responseResultFailure(result) {
+		return nil, fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
 
 	var readResult ConsoleReadResult
 	if err := decodeResult(result, &readResult); err != nil {
@@ -106,24 +116,45 @@ func (c *MsfConsole) Write(ctx context.Context, command string) error {
 	if !strings.HasSuffix(command, "\n") {
 		command += "\n"
 	}
-	_, err := c.rpc.Call(ctx, ConsoleWrite, c.CID, command)
-	return err
+	result, err := c.rpc.Call(ctx, ConsoleWrite, c.CID, command)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
+	return nil
 }
 
 func (c *MsfConsole) SessionKill(ctx context.Context) error {
-	_, err := c.rpc.Call(ctx, ConsoleSessionKill, c.CID)
-	return err
+	result, err := c.rpc.Call(ctx, ConsoleSessionKill, c.CID)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
+	return nil
 }
 
 func (c *MsfConsole) SessionDetach(ctx context.Context) error {
-	_, err := c.rpc.Call(ctx, ConsoleSessionDetach, c.CID)
-	return err
+	result, err := c.rpc.Call(ctx, ConsoleSessionDetach, c.CID)
+	if err != nil {
+		return err
+	}
+	if responseResultFailure(result) {
+		return fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
+	}
+	return nil
 }
 
 func (c *MsfConsole) Tabs(ctx context.Context, line string) ([]string, error) {
 	result, err := c.rpc.Call(ctx, ConsoleTabs, c.CID, line)
 	if err != nil {
 		return nil, err
+	}
+	if responseResultFailure(result) {
+		return nil, fmt.Errorf("%w: %s", ErrConsoleNotFound, c.CID)
 	}
 
 	return responseStringSlice(result, "tabs")
@@ -144,33 +175,84 @@ func (c *MsfConsole) IsBusy(ctx context.Context) (bool, error) {
 	return false, ErrConsoleNotFound
 }
 
-func (c *MsfConsole) RunCommand(ctx context.Context, command string, timeout time.Duration) (string, error) {
+// consoleCommandGrace bounds the wait between reads of an idle console.
+// Picking up a written command takes the framework a few milliseconds, and
+// the trailing output of a command that just finished is already queued, so
+// a short wait suffices where a full poll interval would waste the caller's
+// budget.
+const consoleCommandGrace = 25 * time.Millisecond
+
+// RunCommand writes command to the console and returns the output it
+// collects, including anything already pending on the console. Completion
+// is decided as follows:
+//
+//   - Output arriving on an idle read completes the command, unless it is
+//     the first read after the write: the framework has not picked the
+//     command up yet at that point, and the data is stale output such as a
+//     fresh console's banner. A short follow-up read settles which it was.
+//   - An idle read with no output completes the command only after a second
+//     consecutive idle read and only once the console reported activity.
+//     Metasploit drains output before sampling the busy flag, so the first
+//     idle read can report empty while the command's final output is still
+//     queued; the second read collects it.
+//
+// A command that never reports busy and produces no output cannot be
+// distinguished from a queued command and runs into the timeout, as does
+// one whose console stays busy for the whole timeout. The timeout bounds
+// the whole helper: the write, every read and every wait.
+func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
 	if err := c.Write(ctx, command); err != nil {
-		return "", err
+		return "", commandTimeoutError(parent, ctx, command, err)
 	}
 
-	start := time.Now()
 	var output string
+	activity := false
+	idleReads := 0
+	first := true
 
-	for time.Since(start) < timeout {
-		if err := ctx.Err(); err != nil {
-			return output, err
-		}
-
+	for {
 		result, err := c.Read(ctx)
 		if err != nil {
-			return output, err
+			return output, commandTimeoutError(parent, ctx, command, err)
 		}
 		output += result.Data
 
-		if !result.Busy && result.Data != "" {
+		if result.Busy {
+			activity = true
+			idleReads = 0
+			first = false
+			if err := waitForPoll(ctx, c.pollInterval); err != nil {
+				return output, commandTimeoutError(parent, ctx, command, err)
+			}
+			continue
+		}
+
+		idleReads++
+		if result.Data != "" {
+			activity = true
+			if !first {
+				return output, nil
+			}
+		} else if activity && idleReads >= 2 {
 			return output, nil
 		}
+		first = false
 
-		if err := waitForPoll(ctx, c.pollInterval); err != nil {
-			return output, err
+		if err := waitForPoll(ctx, c.idleWait()); err != nil {
+			return output, commandTimeoutError(parent, ctx, command, err)
 		}
 	}
+}
 
-	return output, fmt.Errorf("%w: %s", ErrCommandTimeout, command)
+// idleWait is the pause between reads of an idle console: short enough to
+// observe command pickup within a small budget, never longer than the poll
+// interval.
+func (c *MsfConsole) idleWait() time.Duration {
+	if c.pollInterval < consoleCommandGrace {
+		return c.pollInterval
+	}
+	return consoleCommandGrace
 }
