@@ -3,6 +3,9 @@ package gomsf
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -65,6 +68,30 @@ type Console struct {
 	ID     string `msgpack:"id" json:"id"`
 	Prompt string `msgpack:"prompt" json:"prompt"`
 	Busy   bool   `msgpack:"busy" json:"busy"`
+}
+
+// UnmarshalMsgpack accepts the console ID either as a string (current
+// msfrpcd) or as an integer (the documented form), normalizing both to the
+// string ID the library exposes.
+func (c *Console) UnmarshalMsgpack(data []byte) error {
+	var raw struct {
+		ID     interface{} `msgpack:"id"`
+		Prompt string      `msgpack:"prompt"`
+		Busy   bool        `msgpack:"busy"`
+	}
+	if err := msgpack.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	id, ok := identifierToString(raw.ID)
+	if !ok || id == "" {
+		return fmt.Errorf("console id must be a non-empty string or integer")
+	}
+
+	c.ID = id
+	c.Prompt = raw.Prompt
+	c.Busy = raw.Busy
+	return nil
 }
 
 type ConsoleReadResult struct {

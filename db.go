@@ -28,12 +28,7 @@ func (m *DbManager) Connect(ctx context.Context, opts map[string]interface{}) er
 		return err
 	}
 
-	res, err := responseMap(result)
-	if err != nil {
-		return err
-	}
-
-	status, err := responseString(res, "result")
+	status, err := responseResultStatus(result)
 	if err != nil {
 		return err
 	}
@@ -45,8 +40,20 @@ func (m *DbManager) Connect(ctx context.Context, opts map[string]interface{}) er
 }
 
 func (m *DbManager) Disconnect(ctx context.Context) error {
-	_, err := m.rpc.Call(ctx, DbDisconnect)
-	return err
+	result, err := m.rpc.Call(ctx, DbDisconnect)
+	if err != nil {
+		return err
+	}
+
+	status, err := responseResultStatus(result)
+	if err != nil {
+		return err
+	}
+	if status != "success" {
+		return fmt.Errorf("db disconnect failed: %s", status)
+	}
+
+	return nil
 }
 
 func (m *DbManager) Driver(ctx context.Context) (string, error) {
@@ -85,8 +92,20 @@ func (m *DbManager) CurrentWorkspace(ctx context.Context) (string, error) {
 }
 
 func (m *DbManager) SetWorkspace(ctx context.Context, name string) error {
-	_, err := m.rpc.Call(ctx, DbSetWorkspace, name)
-	return err
+	result, err := m.rpc.Call(ctx, DbSetWorkspace, name)
+	if err != nil {
+		return err
+	}
+
+	status, err := responseResultStatus(result)
+	if err != nil {
+		return err
+	}
+	if status != "success" {
+		return fmt.Errorf("set workspace %q failed: %s", name, status)
+	}
+
+	return nil
 }
 
 // The db.* read methods take an options hash. Recognized keys include
@@ -189,13 +208,37 @@ func (m *WorkspaceManager) List(ctx context.Context) ([]string, error) {
 }
 
 func (m *WorkspaceManager) Add(ctx context.Context, name string) error {
-	_, err := m.rpc.Call(ctx, DbAddWorkspace, name)
-	return err
+	result, err := m.rpc.Call(ctx, DbAddWorkspace, name)
+	if err != nil {
+		return err
+	}
+
+	status, err := responseResultStatus(result)
+	if err != nil {
+		return err
+	}
+	if status != "success" {
+		return fmt.Errorf("add workspace %q failed: %s", name, status)
+	}
+
+	return nil
 }
 
 func (m *WorkspaceManager) Remove(ctx context.Context, name string) error {
-	_, err := m.rpc.Call(ctx, DbDelWorkspace, name)
-	return err
+	result, err := m.rpc.Call(ctx, DbDelWorkspace, name)
+	if err != nil {
+		return err
+	}
+
+	status, err := responseResultStatus(result)
+	if err != nil {
+		return err
+	}
+	if status != "success" {
+		return fmt.Errorf("remove workspace %q failed: %s", name, status)
+	}
+
+	return nil
 }
 
 func (m *WorkspaceManager) Get(ctx context.Context, name string) (*Workspace, error) {

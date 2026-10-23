@@ -1,6 +1,7 @@
 package gomsf
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strconv"
@@ -22,21 +23,19 @@ func (m *SessionManager) List(ctx context.Context) (map[string]*Session, error) 
 		return nil, err
 	}
 
-	sessions, err := responseMap(result)
-	if err != nil {
+	// Decode the whole map in one pass; decoding each session separately
+	// re-serialized every entry and scaled poorly with large session tables.
+	sessions := make(map[string]*Session)
+	if err := decodeResult(result, &sessions); err != nil {
 		return nil, err
 	}
-
-	resultSessions := make(map[string]*Session, len(sessions))
-	for id, data := range sessions {
-		var session Session
-		if err := decodeResult(data, &session); err != nil {
-			return nil, fmt.Errorf("%w: invalid session %s", ErrUnexpectedResponse, id)
+	for id, session := range sessions {
+		if session == nil {
+			return nil, fmt.Errorf("%w: nil session %s", ErrUnexpectedResponse, id)
 		}
-		resultSessions[id] = &session
 	}
 
-	return resultSessions, nil
+	return sessions, nil
 }
 
 func (m *SessionManager) Get(ctx context.Context, sid string) (*Session, error) {
@@ -55,6 +54,9 @@ func (m *SessionManager) Get(ctx context.Context, sid string) (*Session, error) 
 
 func (m *SessionManager) Stop(ctx context.Context, sid string) error {
 	_, err := m.rpc.Call(ctx, SessionStop, sid)
+	if err != nil && rpcErrorMessage(err, "Unknown Session ID") {
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sid)
+	}
 	return err
 }
 
@@ -167,41 +169,14 @@ func (s *MeterpreterSession) DirectorySeparator(ctx context.Context) (string, er
 }
 
 // RunWithOutput writes cmd and collects output until one of endStrings
-// appears in it, or until any output arrives when endStrings is nil. The
+// appears in it, or until any output arrives when endStrings is empty. The
 // timeout bounds the whole helper: the write, every read and every poll
 // wait.
 func (s *MeterpreterSession) RunWithOutput(parent context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-
-	if err := s.Write(ctx, cmd); err != nil {
-		return "", commandTimeoutError(parent, ctx, cmd, err)
-	}
-
-	var output string
-	for {
-		data, err := s.Read(ctx)
-		if err != nil {
-			return output, commandTimeoutError(parent, ctx, cmd, err)
-		}
-		output += data
-
-		if endStrings == nil {
-			if output != "" {
-				return output, nil
-			}
-		} else {
-			for _, endStr := range endStrings {
-				if strings.Contains(output, endStr) {
-					return output, nil
-				}
-			}
-		}
-
-		if err := waitForPoll(ctx, s.pollInterval); err != nil {
-			return output, commandTimeoutError(parent, ctx, cmd, err)
-		}
-	}
+	return runSessionCommand(parent, cmd, endStrings, timeout, s.pollInterval,
+		func(ctx context.Context) error { return s.Write(ctx, cmd) },
+		s.Read,
+	)
 }
 
 type ShellSession struct {
@@ -247,32 +222,80 @@ func (s *ShellSession) Upgrade(ctx context.Context, lhost string, lport int) err
 }
 
 // RunWithOutput writes cmd and collects output until one of endStrings
-// appears in it. The timeout bounds the whole helper: the write, every read
-// and every poll wait.
+// appears in it, or until any output arrives when endStrings is empty. The
+// timeout bounds the whole helper: the write, every read and every poll
+// wait.
 func (s *ShellSession) RunWithOutput(parent context.Context, cmd string, endStrings []string, timeout time.Duration) (string, error) {
+	return runSessionCommand(parent, cmd, endStrings, timeout, s.pollInterval,
+		func(ctx context.Context) error { return s.Write(ctx, cmd) },
+		s.Read,
+	)
+}
+
+// runSessionCommand is the polling loop shared by shell and meterpreter
+// command helpers. Output accumulates in a byte slice, and each new chunk is
+// searched only in the window that a match completing in it can start. The
+// accumulator is never converted back to a string for scanning, so no step is
+// proportional to the whole output on every read.
+func runSessionCommand(
+	parent context.Context,
+	cmd string,
+	endStrings []string,
+	timeout time.Duration,
+	interval time.Duration,
+	write func(context.Context) error,
+	read func(context.Context) (string, error),
+) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	if err := s.Write(ctx, cmd); err != nil {
+	if err := write(ctx); err != nil {
 		return "", commandTimeoutError(parent, ctx, cmd, err)
 	}
 
-	var output string
+	ends := make([][]byte, len(endStrings))
+	for i, end := range endStrings {
+		ends[i] = []byte(end)
+	}
+
+	var output []byte
+	previousLen := 0
 	for {
-		data, err := s.Read(ctx)
+		data, err := read(ctx)
 		if err != nil {
-			return output, commandTimeoutError(parent, ctx, cmd, err)
+			return string(output), commandTimeoutError(parent, ctx, cmd, err)
 		}
-		output += data
 
-		for _, endStr := range endStrings {
-			if strings.Contains(output, endStr) {
-				return output, nil
+		if data != "" {
+			output = append(output, data...)
+			if len(ends) == 0 {
+				return string(output), nil
 			}
+			if outputContainsEnd(output, previousLen, ends) {
+				return string(output), nil
+			}
+			previousLen = len(output)
 		}
 
-		if err := waitForPoll(ctx, s.pollInterval); err != nil {
-			return output, commandTimeoutError(parent, ctx, cmd, err)
+		if err := waitForPoll(ctx, interval); err != nil {
+			return string(output), commandTimeoutError(parent, ctx, cmd, err)
 		}
 	}
+}
+
+// outputContainsEnd reports whether any end marker appears in output, which
+// has previousLen bytes of already-scanned content followed by new data. A
+// match that is complete now and was not complete before must start no
+// earlier than previousLen-len(marker)+1, so only that suffix is rescanned.
+func outputContainsEnd(output []byte, previousLen int, ends [][]byte) bool {
+	for _, end := range ends {
+		start := previousLen - len(end) + 1
+		if start < 0 {
+			start = 0
+		}
+		if bytes.Contains(output[start:], end) {
+			return true
+		}
+	}
+	return false
 }

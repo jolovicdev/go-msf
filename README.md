@@ -106,14 +106,23 @@ client, err := gomsf.NewClientWithToken(token, options...)
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithHost(host)` | `127.0.0.1` | RPC server host |
+| `WithHost(host)` | `127.0.0.1` | RPC server host (IPv4, hostname, or IPv6 literal) |
 | `WithPort(port)` | `55553` | RPC server port |
 | `WithURI(uri)` | `/api/` | RPC endpoint path |
 | `WithSSL(enabled)` | `true` | Use HTTPS (disable with `false`) |
 | `WithUsername(username)` | `msf` | RPC username |
-| `WithHTTPClient(client)` | `http.DefaultClient` | Custom HTTP client |
-| `WithConsolePollInterval(d)` | `500ms` | Console polling interval |
+| `WithHTTPClient(client)` | tuned client (no global timeout) | Custom HTTP client |
+| `WithCallTimeout(d)` | `2m` | Fallback deadline for calls whose context has none |
+| `WithConsolePollInterval(d)` | `500ms` | Console polling interval (busy/idle command waits are capped at 50ms/25ms) |
 | `WithSessionPollInterval(d)` | `1s` | Session polling interval |
+
+The default HTTP client has no global timeout: each RPC is bounded by the
+`context.Context` passed to it, so long operations such as
+`core.reload_modules` are not cut off. Calls whose context has no deadline use
+a two-minute fallback deadline, and `NewClient` bounds its initial
+authentication to 30 seconds. Pass `WithHTTPClient` to apply a different
+global timeout, or a context with a longer deadline for exceptionally long
+operations.
 
 ### Core Operations
 
