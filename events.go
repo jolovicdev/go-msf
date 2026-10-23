@@ -43,6 +43,10 @@ type Event struct {
 // events are never dropped but a slow consumer slows the monitor down with
 // it. Size the buffer with WithEventBuffer if consumers may stall.
 //
+// Session, job and watched-output polling run in separate loops, and each
+// RPC is bounded by WithEventPollTimeout (30 seconds by default), so one
+// stuck stream or list call does not stall the others.
+//
 // Watching a session or console transfers ownership of its output to the
 // monitor: session.shell_read / session.meterpreter_read / console.read drain
 // the server-side buffer, so a watched stream must only be read through the
@@ -52,11 +56,13 @@ type EventMonitor struct {
 	sessionInterval time.Duration
 	jobInterval     time.Duration
 	outputInterval  time.Duration
+	pollTimeout     time.Duration
 	buffer          int
 
 	mu              sync.Mutex
 	watchedSessions map[string]bool
 	watchedConsoles map[string]bool
+	sessions        map[string]*Session
 
 	ch chan Event
 }
@@ -67,6 +73,14 @@ const (
 	defaultEventBuffer         = 256
 	defaultEventJobInterval    = time.Second
 	defaultEventOutputInterval = 500 * time.Millisecond
+	// defaultEventPollTimeout bounds one session/job list call or one
+	// watched output read. Without it a monitor context without a deadline
+	// would let a stuck msfrpcd response hang a poll loop indefinitely.
+	defaultEventPollTimeout = 30 * time.Second
+	// eventOutputConcurrency bounds the parallel reads issued for watched
+	// sessions and consoles so a large watch set does not serialize into
+	// one poll interval per stream or flood msfrpcd.
+	eventOutputConcurrency = 8
 )
 
 func WithEventSessionInterval(interval time.Duration) EventOption {
@@ -84,6 +98,14 @@ func WithEventJobInterval(interval time.Duration) EventOption {
 func WithEventOutputInterval(interval time.Duration) EventOption {
 	return func(m *EventMonitor) {
 		m.outputInterval = interval
+	}
+}
+
+// WithEventPollTimeout bounds one session/job list call or one watched output
+// read. The default is 30 seconds.
+func WithEventPollTimeout(timeout time.Duration) EventOption {
+	return func(m *EventMonitor) {
+		m.pollTimeout = timeout
 	}
 }
 
@@ -105,6 +127,7 @@ func NewEventMonitor(ctx context.Context, rpc RPCCaller, opts ...EventOption) *E
 		sessionInterval: defaultSessionPollInterval,
 		jobInterval:     defaultEventJobInterval,
 		outputInterval:  defaultEventOutputInterval,
+		pollTimeout:     defaultEventPollTimeout,
 		buffer:          defaultEventBuffer,
 		watchedSessions: make(map[string]bool),
 		watchedConsoles: make(map[string]bool),
@@ -121,6 +144,9 @@ func NewEventMonitor(ctx context.Context, rpc RPCCaller, opts ...EventOption) *E
 	}
 	if m.outputInterval <= 0 {
 		m.outputInterval = defaultEventOutputInterval
+	}
+	if m.pollTimeout <= 0 {
+		m.pollTimeout = defaultEventPollTimeout
 	}
 	if m.buffer <= 0 {
 		m.buffer = defaultEventBuffer
@@ -166,42 +192,112 @@ func (m *EventMonitor) UnwatchConsole(cid string) {
 }
 
 func (m *EventMonitor) run(ctx context.Context) {
-	defer close(m.ch)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		m.pollSessions(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		m.pollJobs(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		m.pollOutputStreams(ctx)
+	}()
+	wg.Wait()
+	close(m.ch)
+}
 
-	sessionTicker := time.NewTicker(m.sessionInterval)
-	defer sessionTicker.Stop()
-	jobTicker := time.NewTicker(m.jobInterval)
-	defer jobTicker.Stop()
-	outputTicker := time.NewTicker(m.outputInterval)
-	defer outputTicker.Stop()
+// pollSessions owns session.list and the session snapshot that output
+// polling uses. It runs independently of the job and output loops so a slow
+// session poll cannot delay either.
+func (m *EventMonitor) pollSessions(ctx context.Context) {
+	ticker := time.NewTicker(m.sessionInterval)
+	defer ticker.Stop()
 
-	lastSessions := make(map[string]*Session)
-	lastJobs := make(map[string]string)
+	last := make(map[string]*Session)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pollCtx, cancel := m.pollContext(ctx)
+			sessions, err := NewSessionManager(m.rpc).List(pollCtx)
+			cancel()
+			if err != nil {
+				m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), Err: err})
+				continue
+			}
+			m.setSessions(sessions)
+			m.diffSessions(ctx, last, sessions)
+			last = sessions
+		}
+	}
+}
+
+// pollJobs owns job.list and runs independently of the other polls.
+func (m *EventMonitor) pollJobs(ctx context.Context) {
+	ticker := time.NewTicker(m.jobInterval)
+	defer ticker.Stop()
+
+	last := make(map[string]string)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pollCtx, cancel := m.pollContext(ctx)
+			jobs, err := NewJobManager(m.rpc).List(pollCtx)
+			cancel()
+			if err != nil {
+				m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), Err: err})
+				continue
+			}
+			m.diffJobs(ctx, last, jobs)
+			last = jobs
+		}
+	}
+}
+
+// pollOutputStreams runs the watched output fan-out independently of the
+// session and job list polls.
+func (m *EventMonitor) pollOutputStreams(ctx context.Context) {
+	ticker := time.NewTicker(m.outputInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-sessionTicker.C:
-			sessions, err := NewSessionManager(m.rpc).List(ctx)
-			if err != nil {
-				m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), Err: err})
-				continue
-			}
-			m.diffSessions(ctx, lastSessions, sessions)
-			lastSessions = sessions
-		case <-jobTicker.C:
-			jobs, err := NewJobManager(m.rpc).List(ctx)
-			if err != nil {
-				m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), Err: err})
-				continue
-			}
-			m.diffJobs(ctx, lastJobs, jobs)
-			lastJobs = jobs
-		case <-outputTicker.C:
-			m.pollOutputs(ctx, lastSessions)
+		case <-ticker.C:
+			m.pollOutputs(ctx, m.sessionSnapshot())
 		}
 	}
+}
+
+// pollContext applies the monitor's per-RPC timeout. A caller context with an
+// earlier deadline still wins.
+func (m *EventMonitor) pollContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := m.pollTimeout
+	if timeout <= 0 {
+		timeout = defaultEventPollTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func (m *EventMonitor) setSessions(sessions map[string]*Session) {
+	m.mu.Lock()
+	m.sessions = sessions
+	m.mu.Unlock()
+}
+
+func (m *EventMonitor) sessionSnapshot() map[string]*Session {
+	m.mu.Lock()
+	sessions := m.sessions
+	m.mu.Unlock()
+	return sessions
 }
 
 func (m *EventMonitor) diffSessions(ctx context.Context, last, current map[string]*Session) {
@@ -212,8 +308,11 @@ func (m *EventMonitor) diffSessions(ctx context.Context, last, current map[strin
 	}
 	for id, session := range last {
 		if _, ok := current[id]; !ok {
-			m.emit(ctx, Event{Type: EventSessionClosed, Timestamp: time.Now(), SessionID: id, Session: session})
+			// Stop output polling before announcing the close so a consumer
+			// reacting to the event does not race a new read of the dead
+			// session.
 			m.UnwatchSession(id)
+			m.emit(ctx, Event{Type: EventSessionClosed, Timestamp: time.Now(), SessionID: id, Session: session})
 		}
 	}
 }
@@ -243,6 +342,26 @@ func (m *EventMonitor) pollOutputs(ctx context.Context, sessions map[string]*Ses
 	}
 	m.mu.Unlock()
 
+	if len(sessionIDs)+len(consoleIDs) == 0 {
+		return
+	}
+
+	// One watched stream is one RPC round trip. Run a bounded number in
+	// parallel and emit each event as soon as its read finishes: a slow or
+	// hung stream must not hold back output already collected from the
+	// others. Every read also gets the monitor's poll timeout.
+	sem := make(chan struct{}, eventOutputConcurrency)
+	var wg sync.WaitGroup
+
+	acquire := func() bool {
+		select {
+		case sem <- struct{}{}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	for _, sid := range sessionIDs {
 		// A watched session missing from the last snapshot closed between
 		// refreshes; the session poll will emit session_closed and unwatch it.
@@ -251,32 +370,58 @@ func (m *EventMonitor) pollOutputs(ctx context.Context, sessions map[string]*Ses
 			continue
 		}
 
-		var data string
-		var err error
-		if s.Type == "meterpreter" {
-			data, err = NewMeterpreterSession(m.rpc, sid).Read(ctx)
-		} else {
-			data, err = NewShellSession(m.rpc, sid).Read(ctx)
-		}
-		if err != nil {
-			m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), SessionID: sid, Err: err})
-			continue
-		}
-		if data != "" {
-			m.emit(ctx, Event{Type: EventSessionOutput, Timestamp: time.Now(), SessionID: sid, Data: data})
-		}
+		wg.Add(1)
+		go func(sid string, sessionType string) {
+			defer wg.Done()
+			if !acquire() {
+				return
+			}
+			defer func() { <-sem }()
+
+			streamCtx, cancel := m.pollContext(ctx)
+			defer cancel()
+
+			var data string
+			var err error
+			if sessionType == "meterpreter" {
+				data, err = NewMeterpreterSession(m.rpc, sid).Read(streamCtx)
+			} else {
+				data, err = NewShellSession(m.rpc, sid).Read(streamCtx)
+			}
+			if err != nil {
+				m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), SessionID: sid, Err: err})
+				return
+			}
+			if data != "" {
+				m.emit(ctx, Event{Type: EventSessionOutput, Timestamp: time.Now(), SessionID: sid, Data: data})
+			}
+		}(sid, s.Type)
 	}
 
 	for _, cid := range consoleIDs {
-		result, err := NewMsfConsole(m.rpc, cid).Read(ctx)
-		if err != nil {
-			m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), ConsoleID: cid, Err: err})
-			continue
-		}
-		if result.Data != "" {
-			m.emit(ctx, Event{Type: EventConsoleOutput, Timestamp: time.Now(), ConsoleID: cid, Data: result.Data})
-		}
+		wg.Add(1)
+		go func(cid string) {
+			defer wg.Done()
+			if !acquire() {
+				return
+			}
+			defer func() { <-sem }()
+
+			streamCtx, cancel := m.pollContext(ctx)
+			defer cancel()
+
+			result, err := NewMsfConsole(m.rpc, cid).Read(streamCtx)
+			if err != nil {
+				m.emit(ctx, Event{Type: EventError, Timestamp: time.Now(), ConsoleID: cid, Err: err})
+				return
+			}
+			if result.Data != "" {
+				m.emit(ctx, Event{Type: EventConsoleOutput, Timestamp: time.Now(), ConsoleID: cid, Data: result.Data})
+			}
+		}(cid)
 	}
+
+	wg.Wait()
 }
 
 func (m *EventMonitor) emit(ctx context.Context, e Event) {

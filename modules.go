@@ -59,14 +59,22 @@ func (m *ModuleManager) Use(ctx context.Context, modType ModuleType, name string
 }
 
 func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name string) (*MsfModuleInfo, error) {
+	info, _, err := m.info(ctx, modType, name)
+	return info, err
+}
+
+// info fetches module.info and also returns the raw map. NewModuleWithContext
+// uses the embedded "options" map from the same response instead of issuing a
+// second module.options RPC.
+func (m *ModuleManager) info(ctx context.Context, modType ModuleType, name string) (*MsfModuleInfo, map[string]interface{}, error) {
 	result, err := m.rpc.Call(ctx, ModuleInfo, string(modType), name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	data, err := responseMap(result)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	info := &MsfModuleInfo{
@@ -83,7 +91,7 @@ func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name strin
 		for i, a := range rawAuthors {
 			author, ok := a.(string)
 			if !ok {
-				return nil, fmt.Errorf("%w: authors[%d] must be a string", ErrUnexpectedResponse, i)
+				return nil, nil, fmt.Errorf("%w: authors[%d] must be a string", ErrUnexpectedResponse, i)
 			}
 			info.Authors = append(info.Authors, author)
 		}
@@ -96,11 +104,11 @@ func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name strin
 		for key, rawName := range rawTargets {
 			index, err := strconv.Atoi(key)
 			if err != nil {
-				return nil, fmt.Errorf("%w: target key %q must be an index", ErrUnexpectedResponse, key)
+				return nil, nil, fmt.Errorf("%w: target key %q must be an index", ErrUnexpectedResponse, key)
 			}
 			name, ok := rawName.(string)
 			if !ok {
-				return nil, fmt.Errorf("%w: target %d must be a string", ErrUnexpectedResponse, index)
+				return nil, nil, fmt.Errorf("%w: target %d must be a string", ErrUnexpectedResponse, index)
 			}
 			indices = append(indices, index)
 			byIndex[index] = name
@@ -117,15 +125,15 @@ func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name strin
 		for i, r := range rawRefs {
 			pair, ok := r.([]interface{})
 			if !ok || len(pair) < 2 {
-				return nil, fmt.Errorf("%w: references[%d] must be a pair", ErrUnexpectedResponse, i)
+				return nil, nil, fmt.Errorf("%w: references[%d] must be a pair", ErrUnexpectedResponse, i)
 			}
 			refType, ok := pair[0].(string)
 			if !ok {
-				return nil, fmt.Errorf("%w: references[%d] type must be a string", ErrUnexpectedResponse, i)
+				return nil, nil, fmt.Errorf("%w: references[%d] type must be a string", ErrUnexpectedResponse, i)
 			}
 			refValue, ok := pair[1].(string)
 			if !ok {
-				return nil, fmt.Errorf("%w: references[%d] value must be a string", ErrUnexpectedResponse, i)
+				return nil, nil, fmt.Errorf("%w: references[%d] value must be a string", ErrUnexpectedResponse, i)
 			}
 			info.References = append(info.References, ModuleReference{Type: refType, Value: refValue})
 		}
@@ -134,10 +142,10 @@ func (m *ModuleManager) Info(ctx context.Context, modType ModuleType, name strin
 	// rpc_info always reports name and rank for a valid module; anything
 	// else means the response is malformed.
 	if info.Name == "" || info.Rank == "" {
-		return nil, fmt.Errorf("%w: missing module name or rank", ErrUnexpectedResponse)
+		return nil, nil, fmt.Errorf("%w: missing module name or rank", ErrUnexpectedResponse)
 	}
 
-	return info, nil
+	return info, data, nil
 }
 
 // CompatiblePayloads returns the payloads compatible with an exploit.
@@ -195,6 +203,17 @@ func NewModule(rpc RPCCaller, modType ModuleType, name string) (*Module, error) 
 	return NewModuleWithContext(context.Background(), rpc, modType, name)
 }
 
+// moduleOptionsResult carries the module.options RPC used for evasion
+// modules and for servers that omit options from module.info.
+type moduleOptionsResult struct {
+	result interface{}
+	err    error
+}
+
+// NewModuleWithContext loads a module's metadata and option defaults.
+// msfrpcd embeds the full options map in module.info, so normal modules use
+// one RPC; evasion modules additionally fetch module.options for the
+// per-option evasion flags that module.info omits.
 func NewModuleWithContext(ctx context.Context, rpc RPCCaller, modType ModuleType, name string) (*Module, error) {
 	mod := &Module{
 		rpc:        rpc,
@@ -203,21 +222,61 @@ func NewModuleWithContext(ctx context.Context, rpc RPCCaller, modType ModuleType
 		runOptions: make(map[string]interface{}),
 	}
 
-	rawOptions, err := rpc.Call(ctx, ModuleOptions, string(modType), name)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// module.info already embeds the full options map, so loading a module
+	// needs one RPC rather than two. Evasion modules are the exception:
+	// module.info omits the per-option "evasion" flag, so those still fetch
+	// module.options concurrently with the info call.
+	if modType == EvasionModuleType {
+		optionsCh := make(chan moduleOptionsResult, 1)
+		go func() {
+			raw, err := rpc.Call(ctx, ModuleOptions, string(modType), name)
+			optionsCh <- moduleOptionsResult{result: raw, err: err}
+		}()
+
+		info, _, err := NewModuleManager(rpc).info(ctx, modType, name)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+
+		optionsRes := <-optionsCh
+		if optionsRes.err != nil {
+			return nil, optionsRes.err
+		}
+		optionsMap, err := responseMap(optionsRes.result)
+		if err != nil {
+			return nil, err
+		}
+		if err := mod.parseOptions(optionsMap); err != nil {
+			return nil, err
+		}
+		mod.Info = info
+		return mod, nil
+	}
+
+	info, raw, err := NewModuleManager(rpc).info(ctx, modType, name)
 	if err != nil {
 		return nil, err
 	}
 
-	optionsMap, err := responseMap(rawOptions)
-	if err != nil {
-		return nil, err
+	optionsMap, ok := raw["options"].(map[string]interface{})
+	if !ok {
+		// Legacy msfrpcd versions and test doubles may omit options from
+		// module.info; fall back to the dedicated RPC.
+		result, err := rpc.Call(ctx, ModuleOptions, string(modType), name)
+		if err != nil {
+			return nil, err
+		}
+		optionsMap, err = responseMap(result)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	if err := mod.parseOptions(optionsMap); err != nil {
-		return nil, err
-	}
-
-	info, err := NewModuleManager(rpc).Info(ctx, modType, name)
-	if err != nil {
 		return nil, err
 	}
 	mod.Info = info
@@ -438,6 +497,10 @@ func (m *Module) CompatibleSessions(ctx context.Context) ([]string, error) {
 }
 
 func (m *Module) ExecuteWithPayload(ctx context.Context, payload *Module) (*ModuleExecuteResult, error) {
+	if payload == nil {
+		return nil, fmt.Errorf("payload module is nil")
+	}
+
 	options := m.RunOptions()
 	options["PAYLOAD"] = payload.Name
 

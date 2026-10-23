@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,10 +27,21 @@ type Client struct {
 	authGeneration      uint64
 	tokenMu             sync.RWMutex
 	reauthMu            sync.Mutex
-	reauthWait          chan struct{}
+	reauth              *reauthAttempt
 	client              *http.Client
+	callTimeout         time.Duration
 	consolePollInterval time.Duration
 	sessionPollInterval time.Duration
+}
+
+// reauthAttempt is one in-flight re-authentication shared by every caller
+// that saw the same rejected token. Waiters wake when done is closed and
+// read token/err, which are written before the close; the fields are not
+// touched afterwards.
+type reauthAttempt struct {
+	done  chan struct{}
+	token string
+	err   error
 }
 
 type ClientOption func(*Client)
@@ -36,6 +49,14 @@ type ClientOption func(*Client)
 const (
 	defaultConsolePollInterval = 500 * time.Millisecond
 	defaultSessionPollInterval = time.Second
+	// defaultLoginTimeout bounds the one call made without a caller-supplied
+	// context: the initial authentication in NewClient.
+	defaultLoginTimeout = 30 * time.Second
+	// defaultCallTimeout is the fallback for callers that pass a context
+	// without a deadline. It is long enough for module reloads and imports
+	// but still turns an otherwise indefinite hang into a timeout. Callers
+	// that need longer should pass a context with a longer deadline.
+	defaultCallTimeout = 2 * time.Minute
 )
 
 func WithHost(host string) ClientOption {
@@ -86,6 +107,15 @@ func WithSessionPollInterval(interval time.Duration) ClientOption {
 	}
 }
 
+// WithCallTimeout sets the fallback deadline applied to RPC calls whose
+// context has no deadline. The default is two minutes; non-positive values
+// keep the default. A caller-provided context deadline always wins.
+func WithCallTimeout(timeout time.Duration) ClientOption {
+	return func(c *Client) {
+		c.callTimeout = timeout
+	}
+}
+
 func NewClient(password string, opts ...ClientOption) (*Client, error) {
 	c := &Client{
 		host:                "127.0.0.1",
@@ -93,6 +123,7 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 		uri:                 "/api/",
 		ssl:                 true,
 		username:            "msf",
+		callTimeout:         defaultCallTimeout,
 		consolePollInterval: defaultConsolePollInterval,
 		sessionPollInterval: defaultSessionPollInterval,
 	}
@@ -102,12 +133,13 @@ func NewClient(password string, opts ...ClientOption) (*Client, error) {
 	}
 
 	if c.client == nil {
-		c.client = &http.Client{
-			Timeout: 30 * time.Second,
-		}
+		c.client = newDefaultHTTPClient()
 	}
 
-	token, err := c.login(context.Background(), c.username, password)
+	loginCtx, cancel := context.WithTimeout(context.Background(), defaultLoginTimeout)
+	defer cancel()
+
+	token, err := c.login(loginCtx, c.username, password)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +160,7 @@ func NewClientWithToken(token string, opts ...ClientOption) (*Client, error) {
 		ssl:                 true,
 		username:            "msf",
 		token:               token,
+		callTimeout:         defaultCallTimeout,
 		consolePollInterval: defaultConsolePollInterval,
 		sessionPollInterval: defaultSessionPollInterval,
 	}
@@ -137,12 +170,27 @@ func NewClientWithToken(token string, opts ...ClientOption) (*Client, error) {
 	}
 
 	if c.client == nil {
-		c.client = &http.Client{
-			Timeout: 30 * time.Second,
-		}
+		c.client = newDefaultHTTPClient()
 	}
 
 	return c, nil
+}
+
+// newDefaultHTTPClient returns a client tuned for the concurrent polling the
+// library performs. The standard transport only keeps two idle connections
+// per host, so an event poll watching many streams would repeatedly open TLS
+// connections. It has no global timeout: every call is bounded by its
+// context, and NewClient bounds its own login separately.
+func newDefaultHTTPClient() *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{}
+	}
+
+	transport := base.Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 16
+	return &http.Client{Transport: transport}
 }
 
 func (c *Client) url() string {
@@ -150,16 +198,27 @@ func (c *Client) url() string {
 	if c.ssl {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://%s:%d%s", scheme, c.host, c.port, c.uri)
+
+	// net.JoinHostPort brackets IPv6 literals; strip brackets first so a
+	// caller that already supplied them does not end up with [[::1]].
+	host := c.host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+
+	return scheme + "://" + net.JoinHostPort(host, strconv.Itoa(c.port)) + c.uri
 }
 
 // Call performs an RPC round trip. If the server rejects the token and the
 // client was constructed with NewClient, it re-authenticates once and retries.
 // Logout is exempt: a rejected token there only ends the local session.
 func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+	// Capture the token once and use it for both the request and the
+	// staleness check. Re-reading it in between lets a concurrent re-auth
+	// swap in a token that the retry path then wrongly treats as fresh.
 	failedToken := c.Token()
 
-	result, err := c.call(ctx, method, args...)
+	result, err := c.callWithToken(ctx, failedToken, method, args...)
 	if err == nil || method == AuthLogin || method == AuthLogout || !c.hasPassword() || !isInvalidTokenError(err) {
 		return result, err
 	}
@@ -172,16 +231,15 @@ func (c *Client) Call(ctx context.Context, method MsfRpcMethod, args ...interfac
 	return c.callWithToken(ctx, token, method, args...)
 }
 
-func (c *Client) call(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
-	return c.callWithToken(ctx, c.Token(), method, args...)
-}
-
 // callWithToken performs the RPC round trip authenticated with token. Every
 // method except auth.login requires one.
 func (c *Client) callWithToken(ctx context.Context, token string, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
 	if method != AuthLogin && token == "" {
 		return nil, ErrNotAuthenticated
 	}
+
+	ctx, cancel := c.withCallDeadline(ctx)
+	defer cancel()
 
 	reqArgs := make([]interface{}, 0, len(args)+2)
 	reqArgs = append(reqArgs, string(method))
@@ -246,6 +304,20 @@ func (c *Client) callWithToken(ctx context.Context, token string, method MsfRpcM
 	return result, nil
 }
 
+// withCallDeadline applies the client's fallback deadline when the caller
+// supplied a context without one. A caller-provided deadline always wins.
+func (c *Client) withCallDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+
+	timeout := c.callTimeout
+	if timeout <= 0 {
+		timeout = defaultCallTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 // login performs auth.login and returns the fresh token without storing it;
 // callers decide whether the client keeps the session.
 func (c *Client) login(ctx context.Context, username, password string) (string, error) {
@@ -281,8 +353,10 @@ func (c *Client) Logout(ctx context.Context) error {
 	}
 
 	// A stale token has nothing to end server-side; treat it as logged out
-	// instead of re-authenticating and killing the fresh token.
-	_, err := c.call(ctx, AuthLogout, token)
+	// instead of re-authenticating and killing the fresh token. Authenticate
+	// with the same token that is being revoked so a concurrent re-auth
+	// cannot make this call revoke a token it did not authenticate with.
+	_, err := c.callWithToken(ctx, token, AuthLogout, token)
 	if err != nil && !isInvalidTokenError(err) {
 		return err
 	}
@@ -318,60 +392,80 @@ func (c *Client) IsAuthenticated() bool {
 
 // reloginIfStale re-authenticates a client whose token the server rejected
 // and returns the token the caller should retry with. Only one login runs at
-// a time; concurrent callers wait for it and reuse its result, and the wait
-// honors ctx. A login that completes after Logout does not restore the
-// session: the fresh token is handed to the retrying caller only.
+// a time; concurrent callers wait for it and share its result, including a
+// failure, and the wait honors ctx. A login that completes after Logout does
+// not restore the session: the fresh token is handed to the retrying caller
+// only.
 func (c *Client) reloginIfStale(ctx context.Context, failedToken string) (string, error) {
 	for {
 		c.reauthMu.Lock()
-		if c.reauthWait == nil {
-			wait := make(chan struct{})
-			c.reauthWait = wait
+		attempt := c.reauth
+		if attempt == nil {
+			attempt = &reauthAttempt{done: make(chan struct{})}
+			c.reauth = attempt
 			c.reauthMu.Unlock()
 
-			defer func() {
-				c.reauthMu.Lock()
-				c.reauthWait = nil
-				c.reauthMu.Unlock()
-				close(wait)
-			}()
-
-			if token := c.Token(); token != failedToken {
-				return token, nil
-			}
-
-			c.tokenMu.RLock()
-			generation := c.authGeneration
-			password := c.password
-			c.tokenMu.RUnlock()
-
-			token, err := c.login(ctx, c.username, password)
-			if err != nil {
-				return "", err
-			}
-
-			c.tokenMu.Lock()
-			if c.authGeneration == generation {
-				c.token = token
-			}
-			c.tokenMu.Unlock()
-
-			return token, nil
+			c.runReauth(ctx, attempt, failedToken)
+			return attempt.token, attempt.err
 		}
-
-		wait := c.reauthWait
 		c.reauthMu.Unlock()
 
 		select {
-		case <-wait:
+		case <-attempt.done:
+			// A login canceled by the leader's context says nothing about
+			// this caller's context; let a caller whose context is still
+			// alive trigger a fresh attempt instead of inheriting that
+			// cancellation.
+			if attempt.err != nil && isContextError(attempt.err) && ctx.Err() == nil {
+				continue
+			}
+			return attempt.token, attempt.err
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
-
-		if token := c.Token(); token != failedToken {
-			return token, nil
-		}
 	}
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// runReauth performs the shared login attempt and publishes its outcome.
+func (c *Client) runReauth(ctx context.Context, attempt *reauthAttempt, failedToken string) {
+	defer func() {
+		c.reauthMu.Lock()
+		if c.reauth == attempt {
+			c.reauth = nil
+		}
+		c.reauthMu.Unlock()
+		close(attempt.done)
+	}()
+
+	// Another caller may have refreshed the token while this attempt was
+	// being registered; reuse that token instead of logging in again.
+	if token := c.Token(); token != failedToken {
+		attempt.token = token
+		return
+	}
+
+	c.tokenMu.RLock()
+	generation := c.authGeneration
+	password := c.password
+	c.tokenMu.RUnlock()
+
+	token, err := c.login(ctx, c.username, password)
+	if err != nil {
+		attempt.err = err
+		return
+	}
+
+	c.tokenMu.Lock()
+	if c.authGeneration == generation {
+		c.token = token
+	}
+	c.tokenMu.Unlock()
+
+	attempt.token = token
 }
 
 func isInvalidTokenError(err error) bool {
@@ -384,10 +478,16 @@ func isInvalidTokenError(err error) bool {
 	return message
 }
 
-// maxDecodedMapSize bounds the pre-allocation performed for a decoded map;
+// maxDecodedMapSize bounds the number of entries accepted for a decoded map;
 // the length prefix on the wire is untrusted and msfrpcd responses stay far
 // below this.
 const maxDecodedMapSize = 1 << 20
+
+// maxDecodedMapPrealloc caps the initial bucket allocation for a decoded map.
+// Pre-allocating the full wire length would let a five-byte length prefix
+// claim enormous memory before any entries are read; the map still grows as
+// real entries arrive.
+const maxDecodedMapPrealloc = 1 << 10
 
 // maxResponseBytes bounds how much of a response body is decoded at all.
 // Real msfrpcd responses (module listings, console output, loot) stay far
@@ -410,7 +510,11 @@ func stringKeyedMap(d *msgpack.Decoder) (interface{}, error) {
 		return nil, fmt.Errorf("msgpack map length %d exceeds limit %d", n, maxDecodedMapSize)
 	}
 
-	m := make(map[string]interface{}, n)
+	prealloc := n
+	if prealloc > maxDecodedMapPrealloc {
+		prealloc = maxDecodedMapPrealloc
+	}
+	m := make(map[string]interface{}, prealloc)
 	for i := 0; i < n; i++ {
 		key, err := d.DecodeInterface()
 		if err != nil {
@@ -478,9 +582,12 @@ func convertBytesToString(v interface{}) interface{} {
 func decodeResult(data interface{}, target interface{}) error {
 	encoded, err := msgpack.Marshal(data)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: encode response: %v", ErrUnexpectedResponse, err)
 	}
-	return msgpack.Unmarshal(encoded, target)
+	if err := msgpack.Unmarshal(encoded, target); err != nil {
+		return fmt.Errorf("%w: decode response: %v", ErrUnexpectedResponse, err)
+	}
+	return nil
 }
 
 func decodeList[T any](result interface{}, key string) ([]*T, error) {
@@ -502,6 +609,11 @@ func decodeList[T any](result interface{}, key string) ([]*T, error) {
 	var values []*T
 	if err := msgpack.Unmarshal(encoded, &values); err != nil {
 		return nil, fmt.Errorf("%w: invalid %s list: %v", ErrUnexpectedResponse, key, err)
+	}
+	for i, value := range values {
+		if value == nil {
+			return nil, fmt.Errorf("%w: nil %s entry at index %d", ErrUnexpectedResponse, key, i)
+		}
 	}
 
 	return values, nil
@@ -602,6 +714,16 @@ func responseResultFailure(result interface{}) bool {
 	return res == "failure"
 }
 
+// responseResultStatus returns the "result" verdict used by DB operations,
+// which spell failure as "failed" rather than "failure".
+func responseResultStatus(result interface{}) (string, error) {
+	data, err := responseMap(result)
+	if err != nil {
+		return "", err
+	}
+	return responseString(data, "result")
+}
+
 func responseRPCError(result interface{}) (*RPCError, bool) {
 	data, ok := result.(map[string]interface{})
 	if !ok {
@@ -627,7 +749,7 @@ func rpcErrorMessage(err error, message string) bool {
 	if !errors.As(err, &rpcErr) {
 		return false
 	}
-	return rpcErr.Message == message
+	return strings.EqualFold(rpcErr.Message, message)
 }
 
 func (c *Client) consolePollIntervalValue() time.Duration {

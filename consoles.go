@@ -21,26 +21,7 @@ func (m *ConsoleManager) List(ctx context.Context) ([]*Console, error) {
 		return nil, err
 	}
 
-	data, err := responseMap(result)
-	if err != nil {
-		return nil, err
-	}
-
-	consoles, ok := data["consoles"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("%w: expected consoles list", ErrUnexpectedResponse)
-	}
-
-	resultConsoles := make([]*Console, len(consoles))
-	for i, c := range consoles {
-		var console Console
-		if err := decodeResult(c, &console); err != nil {
-			return nil, fmt.Errorf("%w: invalid console entry at index %d", ErrUnexpectedResponse, i)
-		}
-		resultConsoles[i] = &console
-	}
-
-	return resultConsoles, nil
+	return decodeList[Console](result, "consoles")
 }
 
 func (m *ConsoleManager) Create(ctx context.Context) (*Console, error) {
@@ -49,19 +30,12 @@ func (m *ConsoleManager) Create(ctx context.Context) (*Console, error) {
 		return nil, err
 	}
 
-	data, err := responseMap(result)
-	if err != nil {
+	var console Console
+	if err := decodeResult(result, &console); err != nil {
 		return nil, err
 	}
 
-	id, err := responseString(data, "id")
-	if err != nil {
-		return nil, err
-	}
-
-	return &Console{
-		ID: id,
-	}, nil
+	return &console, nil
 }
 
 func (m *ConsoleManager) Destroy(ctx context.Context, cid string) error {
@@ -182,6 +156,12 @@ func (c *MsfConsole) IsBusy(ctx context.Context) (bool, error) {
 // budget.
 const consoleCommandGrace = 25 * time.Millisecond
 
+// consoleBusyWait caps the wait between reads of a busy console. Waiting the
+// full poll interval after the command has already finished is pure latency,
+// so busy consoles are polled faster (while still honoring a smaller
+// configured interval).
+const consoleBusyWait = 50 * time.Millisecond
+
 // RunCommand writes command to the console and returns the output it
 // collects, including anything already pending on the console. Completion
 // is decided as follows:
@@ -208,7 +188,7 @@ func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout 
 		return "", commandTimeoutError(parent, ctx, command, err)
 	}
 
-	var output string
+	var output strings.Builder
 	activity := false
 	idleReads := 0
 	first := true
@@ -216,16 +196,16 @@ func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout 
 	for {
 		result, err := c.Read(ctx)
 		if err != nil {
-			return output, commandTimeoutError(parent, ctx, command, err)
+			return output.String(), commandTimeoutError(parent, ctx, command, err)
 		}
-		output += result.Data
+		output.WriteString(result.Data)
 
 		if result.Busy {
 			activity = true
 			idleReads = 0
 			first = false
-			if err := waitForPoll(ctx, c.pollInterval); err != nil {
-				return output, commandTimeoutError(parent, ctx, command, err)
+			if err := waitForPoll(ctx, c.busyWait()); err != nil {
+				return output.String(), commandTimeoutError(parent, ctx, command, err)
 			}
 			continue
 		}
@@ -234,15 +214,15 @@ func (c *MsfConsole) RunCommand(parent context.Context, command string, timeout 
 		if result.Data != "" {
 			activity = true
 			if !first {
-				return output, nil
+				return output.String(), nil
 			}
 		} else if activity && idleReads >= 2 {
-			return output, nil
+			return output.String(), nil
 		}
 		first = false
 
 		if err := waitForPoll(ctx, c.idleWait()); err != nil {
-			return output, commandTimeoutError(parent, ctx, command, err)
+			return output.String(), commandTimeoutError(parent, ctx, command, err)
 		}
 	}
 }
@@ -255,4 +235,12 @@ func (c *MsfConsole) idleWait() time.Duration {
 		return c.pollInterval
 	}
 	return consoleCommandGrace
+}
+
+// busyWait is the pause between reads of a busy console; see consoleBusyWait.
+func (c *MsfConsole) busyWait() time.Duration {
+	if c.pollInterval < consoleBusyWait {
+		return c.pollInterval
+	}
+	return consoleBusyWait
 }

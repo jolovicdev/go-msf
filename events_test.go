@@ -322,9 +322,22 @@ func TestEventMonitor_ClosedSessionStopsBeingRead(t *testing.T) {
 
 	waitForEvent(t, monitor.C(), EventSessionClosed)
 
+	// A read that started just before the close may still be in flight; let
+	// the read count settle before taking the baseline.
 	mu.Lock()
 	readsAfterClose := reads
 	mu.Unlock()
+	for i := 0; i < 20; i++ {
+		time.Sleep(10 * time.Millisecond)
+		mu.Lock()
+		current := reads
+		mu.Unlock()
+		if current == readsAfterClose {
+			break
+		}
+		readsAfterClose = current
+	}
+
 	time.Sleep(50 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
