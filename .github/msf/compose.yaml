@@ -33,6 +33,9 @@ services:
         condition: service_healthy
     environment:
       RAILS_ENV: production
+      # Throwaway key for the CI-only framework process; Rails 8 refuses to
+      # boot in production without one.
+      SECRET_KEY_BASE: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       # Run as root so the framework can write db/schema.rb during migration.
       MSF_UID: "0"
       MSF_GID: "0"
