@@ -25,10 +25,9 @@ jobs:
           git add .pr-permission-probe
           git commit -m "Probe GITHUB_TOKEN pull request creation"
           git push origin "$branch"
+          body=$(printf '%s\n' "This is by an automated agent, not a human." "" "Temporary permission probe; this PR is closed immediately.")
           set +e
-          out=$(gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" --title "Probe: GITHUB_TOKEN PR creation" --body "This is by an automated agent, not a human.
-
-Temporary permission probe; this PR is closed immediately." 2>&1)
+          out=$(gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" --title "Probe: GITHUB_TOKEN PR creation" --body "$body" 2>&1)
           rc=$?
           set -e
           echo "gh-pr-create-exit=$rc"
