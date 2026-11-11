@@ -393,9 +393,10 @@ func (c *Client) IsAuthenticated() bool {
 // reloginIfStale re-authenticates a client whose token the server rejected
 // and returns the token the caller should retry with. Only one login runs at
 // a time; concurrent callers wait for it and share its result, including a
-// failure, and the wait honors ctx. A login that completes after Logout does
-// not restore the session: the fresh token is handed to the retrying caller
-// only.
+// failure, and the wait honors ctx. A waiter that wakes after another caller
+// refreshed the token again retries with the newest token, not the token the
+// attempt it waited on produced. A login that completes after Logout does not
+// restore the session: the fresh token is handed to the retrying caller only.
 func (c *Client) reloginIfStale(ctx context.Context, failedToken string) (string, error) {
 	for {
 		c.reauthMu.Lock()
@@ -406,7 +407,10 @@ func (c *Client) reloginIfStale(ctx context.Context, failedToken string) (string
 			c.reauthMu.Unlock()
 
 			c.runReauth(ctx, attempt, failedToken)
-			return attempt.token, attempt.err
+			if attempt.err != nil {
+				return "", attempt.err
+			}
+			return c.retryToken(failedToken, attempt.token), nil
 		}
 		c.reauthMu.Unlock()
 
@@ -419,11 +423,27 @@ func (c *Client) reloginIfStale(ctx context.Context, failedToken string) (string
 			if attempt.err != nil && isContextError(attempt.err) && ctx.Err() == nil {
 				continue
 			}
-			return attempt.token, attempt.err
+			if attempt.err != nil {
+				return "", attempt.err
+			}
+			return c.retryToken(failedToken, attempt.token), nil
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
 	}
+}
+
+// retryToken picks the token a caller retries with after re-authentication:
+// the attempt's token, unless another caller refreshed the token again while
+// this caller was waiting or after the attempt completed. Retrying with the
+// older token would fail with "Invalid Token" again. An empty current token
+// means Logout ran; the attempt's fresh token is still handed to the retrying
+// caller.
+func (c *Client) retryToken(failedToken, attemptToken string) string {
+	if token := c.Token(); token != "" && token != failedToken && token != attemptToken {
+		return token
+	}
+	return attemptToken
 }
 
 func isContextError(err error) bool {
@@ -676,12 +696,15 @@ func responseIDSlice(result interface{}, key string) ([]string, error) {
 	return values, nil
 }
 
-// identifierToString accepts a string or any of the integer widths msgpack
-// decoding can produce for a small number.
+// identifierToString accepts a string, a raw msgpack binary string (which is
+// how direct msgpack decoding exposes an identifier sent as str) or any of
+// the integer widths msgpack decoding can produce for a small number.
 func identifierToString(item interface{}) (string, bool) {
 	switch id := item.(type) {
 	case string:
 		return id, true
+	case []byte:
+		return string(id), true
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return fmt.Sprintf("%d", id), true
 	default:

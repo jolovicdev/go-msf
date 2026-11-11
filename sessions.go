@@ -23,10 +23,20 @@ func (m *SessionManager) List(ctx context.Context) (map[string]*Session, error) 
 		return nil, err
 	}
 
+	// A nil result would otherwise decode into an empty map and look like an
+	// empty session table, so reject anything that is not a map first.
+	data, err := responseMap(result)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("%w: expected session list map", ErrUnexpectedResponse)
+	}
+
 	// Decode the whole map in one pass; decoding each session separately
 	// re-serialized every entry and scaled poorly with large session tables.
-	sessions := make(map[string]*Session)
-	if err := decodeResult(result, &sessions); err != nil {
+	sessions := make(map[string]*Session, len(data))
+	if err := decodeResult(data, &sessions); err != nil {
 		return nil, err
 	}
 	for id, session := range sessions {
