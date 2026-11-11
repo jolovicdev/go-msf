@@ -25,6 +25,8 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race ./...
+      - name: Release tooling tests
+        run: bash .github/scripts/release_test.sh
 
   integration:
     name: Live Metasploit RPC integration
