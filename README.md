@@ -3,7 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/jolovicdev/go-msf/v2.svg)](https://pkg.go.dev/github.com/jolovicdev/go-msf/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/jolovicdev/go-msf)](https://goreportcard.com/report/github.com/jolovicdev/go-msf)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-v2.1.1-blue.svg)](https://github.com/jolovicdev/go-msf/releases)
+[![Version](https://img.shields.io/github/v/release/jolovicdev/go-msf?label=version)](https://github.com/jolovicdev/go-msf/releases)
 
 > Production-ready Go client for the Metasploit Framework RPC API. Automate penetration testing, security research, and red team operations with type-safe Go.
 
@@ -30,7 +30,7 @@ Requires Go 1.26 or later.
 
 ## Version
 
-**v2.1.1** — See [releases](https://github.com/jolovicdev/go-msf/releases) for changes. Versioning follows [Semantic Versioning](https://semver.org/).
+The latest release is shown on the badge above. See [releases](https://github.com/jolovicdev/go-msf/releases) for changes; versioning follows [Semantic Versioning](https://semver.org/).
 
 ## Quick Start
 
@@ -274,6 +274,16 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
+
+## Releasing
+
+Releases are automatic. After the [CI](https://github.com/jolovicdev/go-msf/actions/workflows/ci.yml) workflow (unit tests plus the live Metasploit RPC integration job) succeeds on `master`, the [release workflow](.github/workflows/release.yml) reads the conventional commits since the latest `v*` tag and publishes the next version:
+
+- `fix:` bumps the patch version, `feat:` bumps the minor version, and `type!:` or a `BREAKING CHANGE:` footer bumps the major version
+- commits without a fix, feature or breaking change produce no release
+- the workflow pushes an annotated `vX.Y.Z` tag and creates a GitHub Release with concise generated notes: a summary, the notable changes, and the pinned Metasploit Framework version when it changed
+
+Use conventional subjects for pull requests, because the squash commit on `master` determines the bump. Do not push version-bump commits or tags by hand. A major release also requires the matching Go module path (for example `/v3`) in the same change set; the workflow refuses to tag a major version whose module path does not match.
 
 ## Related Projects
 
