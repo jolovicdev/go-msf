@@ -70,9 +70,10 @@ type Console struct {
 	Busy   bool   `msgpack:"busy" json:"busy"`
 }
 
-// UnmarshalMsgpack accepts the console ID either as a string (current
-// msfrpcd) or as an integer (the documented form), normalizing both to the
-// string ID the library exposes.
+// UnmarshalMsgpack accepts the console ID as a string, a raw msgpack binary
+// string (the form direct msgpack decoding sees) or an integer (the
+// documented form), normalizing all of them to the string ID the library
+// exposes.
 func (c *Console) UnmarshalMsgpack(data []byte) error {
 	var raw struct {
 		ID     interface{} `msgpack:"id"`
