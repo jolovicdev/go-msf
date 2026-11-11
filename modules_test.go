@@ -3,6 +3,8 @@ package gomsf
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -396,5 +398,176 @@ func TestModule_MissingRequiredRejectsUnusableValues(t *testing.T) {
 	}
 	if missing := mod.MissingRequired(); slices.Contains(missing, "RHOSTS") {
 		t.Fatalf("RHOSTS set but still reported missing: %v", missing)
+	}
+}
+
+// TestModule_ExecuteWithPayloadDropsNonScalarPayloadDefaults reproduces
+// payload modules whose defaults include structured values, such as
+// AutoLoadExtensions being a list. msfrpcd rejects those values, so
+// module.execute must not receive them.
+func TestModule_ExecuteWithPayloadDropsNonScalarPayloadDefaults(t *testing.T) {
+	var sent map[string]interface{}
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleInfo:
+				switch args[0] {
+				case string(PayloadModuleType):
+					return map[string]interface{}{
+						"name": "Windows x64 Meterpreter",
+						"rank": "normal",
+						"options": map[string]interface{}{
+							"AutoLoadExtensions": map[string]interface{}{
+								"type":    "string",
+								"default": []interface{}{"stdapi"},
+							},
+							"LHOST": map[string]interface{}{"type": "string", "default": "127.0.0.1"},
+						},
+					}, nil
+				case string(ExploitModuleType):
+					return map[string]interface{}{
+						"name": "Test Exploit",
+						"rank": "great",
+						"options": map[string]interface{}{
+							"RHOSTS": map[string]interface{}{"type": "string", "default": "192.0.2.1"},
+							"RPORT":  map[string]interface{}{"type": "integer", "default": int64(445)},
+						},
+					}, nil
+				}
+			case ModuleExecute:
+				sent, _ = args[2].(map[string]interface{})
+				return map[string]interface{}{"job_id": 7, "uuid": "uuid-7"}, nil
+			}
+			return nil, fmt.Errorf("unexpected RPC %s", method)
+		},
+	}
+
+	exploit, err := NewModule(rpc, ExploitModuleType, "test/exploit")
+	if err != nil {
+		t.Fatalf("NewModule(exploit) failed: %v", err)
+	}
+	payload, err := NewModule(rpc, PayloadModuleType, "windows/x64/meterpreter/reverse_tcp")
+	if err != nil {
+		t.Fatalf("NewModule(payload) failed: %v", err)
+	}
+	if _, ok := payload.RunOptions()["AutoLoadExtensions"]; !ok {
+		t.Fatal("fixture: payload should carry the non-scalar default")
+	}
+
+	result, err := exploit.ExecuteWithPayload(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("ExecuteWithPayload failed: %v", err)
+	}
+	if result.JobID != 7 || result.UUID != "uuid-7" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	want := map[string]interface{}{
+		"PAYLOAD": "windows/x64/meterpreter/reverse_tcp",
+		"RHOSTS":  "192.0.2.1",
+		"RPORT":   int64(445),
+		"LHOST":   "127.0.0.1",
+	}
+	if !reflect.DeepEqual(sent, want) {
+		t.Fatalf("module.execute options = %#v, want %#v", sent, want)
+	}
+}
+
+// TestModule_ExecuteDropsNonScalarOptionValues covers the plain Module.Execute
+// path, which shares the same RunOptions source as ExecuteWithPayload.
+func TestModule_ExecuteDropsNonScalarOptionValues(t *testing.T) {
+	var sent map[string]interface{}
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			switch method {
+			case ModuleInfo:
+				return map[string]interface{}{
+					"name": "Test Module",
+					"rank": "normal",
+					"options": map[string]interface{}{
+						"AutoLoadExtensions": map[string]interface{}{"type": "string"},
+						"RHOSTS":             map[string]interface{}{"type": "string", "default": "192.0.2.1"},
+					},
+				}, nil
+			case ModuleExecute:
+				sent, _ = args[2].(map[string]interface{})
+				return map[string]interface{}{"job_id": 3, "uuid": "uuid-3"}, nil
+			}
+			return nil, fmt.Errorf("unexpected RPC %s", method)
+		},
+	}
+
+	mod, err := NewModule(rpc, AuxiliaryModuleType, "test/module")
+	if err != nil {
+		t.Fatalf("NewModule failed: %v", err)
+	}
+	if err := mod.SetOption("AutoLoadExtensions", []interface{}{"stdapi"}); err != nil {
+		t.Fatalf("SetOption failed: %v", err)
+	}
+
+	if _, err := mod.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	want := map[string]interface{}{"RHOSTS": "192.0.2.1"}
+	if !reflect.DeepEqual(sent, want) {
+		t.Fatalf("module.execute options = %#v, want %#v", sent, want)
+	}
+}
+
+// TestModuleManager_ExecuteKeepsScalarOptionValues pins the set of values
+// module.execute accepts so filtering never removes a usable option.
+func TestModuleManager_ExecuteKeepsScalarOptionValues(t *testing.T) {
+	scalars := map[string]interface{}{
+		"nil":     nil,
+		"string":  "value",
+		"bool":    true,
+		"int":     int(-1),
+		"int8":    int8(-8),
+		"int16":   int16(-16),
+		"int32":   int32(-32),
+		"int64":   int64(-64),
+		"uint":    uint(1),
+		"uint8":   uint8(8),
+		"uint16":  uint16(16),
+		"uint32":  uint32(32),
+		"uint64":  uint64(64),
+		"uintptr": uintptr(1),
+		"float32": float32(1.5),
+		"float64": float64(2.5),
+	}
+	nonScalars := map[string]interface{}{
+		"slice":   []interface{}{"stdapi"},
+		"strings": []string{"stdapi"},
+		"bytes":   []byte("stdapi"),
+		"map":     map[string]interface{}{"stdapi": true},
+		"struct":  struct{ Name string }{"stdapi"},
+	}
+
+	options := make(map[string]interface{}, len(scalars)+len(nonScalars))
+	for k, v := range scalars {
+		options[k] = v
+	}
+	for k, v := range nonScalars {
+		options[k] = v
+	}
+
+	var sent map[string]interface{}
+	rpc := fakeRPCCaller{
+		call: func(ctx context.Context, method MsfRpcMethod, args ...interface{}) (interface{}, error) {
+			sent, _ = args[2].(map[string]interface{})
+			return map[string]interface{}{"job_id": 1, "uuid": "uuid-1"}, nil
+		},
+	}
+
+	if _, err := NewModuleManager(rpc).Execute(context.Background(), ExploitModuleType, "test/exploit", options); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(sent, scalars) {
+		t.Fatalf("module.execute options = %#v, want only scalars %#v", sent, scalars)
+	}
+	if len(options) != len(scalars)+len(nonScalars) {
+		t.Fatalf("caller's options were modified: %#v", options)
 	}
 }
