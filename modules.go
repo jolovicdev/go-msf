@@ -173,7 +173,7 @@ func (m *ModuleManager) CompatibleSessions(ctx context.Context, name string) ([]
 }
 
 func (m *ModuleManager) Execute(ctx context.Context, modType ModuleType, name string, options map[string]interface{}) (*ModuleExecuteResult, error) {
-	result, err := m.rpc.Call(ctx, ModuleExecute, string(modType), name, options)
+	result, err := m.rpc.Call(ctx, ModuleExecute, string(modType), name, scalarOptions(options))
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +184,34 @@ func (m *ModuleManager) Execute(ctx context.Context, modType ModuleType, name st
 	}
 
 	return &execResult, nil
+}
+
+// scalarOptions returns a copy of options with the entries module.execute
+// cannot accept removed. msfrpcd only accepts scalar option values, and
+// rejects the whole call when given a structured value such as the
+// AutoLoadExtensions list that payload modules report as a default.
+func scalarOptions(options map[string]interface{}) map[string]interface{} {
+	filtered := make(map[string]interface{}, len(options))
+	for key, value := range options {
+		if isScalarOptionValue(value) {
+			filtered[key] = value
+		}
+	}
+	return filtered
+}
+
+// isScalarOptionValue reports whether value is one of the option types
+// module.execute accepts: nil, string, bool, an integer or a float.
+func isScalarOptionValue(value interface{}) bool {
+	switch value.(type) {
+	case nil, string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, uintptr,
+		float32, float64:
+		return true
+	default:
+		return false
+	}
 }
 
 type Module struct {
