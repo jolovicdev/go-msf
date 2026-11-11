@@ -1,8 +1,44 @@
 name: CI
 on:
   pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   probe:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - run: echo probe-run-ok
+      - uses: actions/checkout@v4
+      - name: Attempt a throwaway PR with GITHUB_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          branch="test/pr-permission-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          echo "permission probe" > .pr-permission-probe
+          git add .pr-permission-probe
+          git commit -m "Probe GITHUB_TOKEN pull request creation"
+          git push origin "$branch"
+          set +e
+          out=$(gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" --title "Probe: GITHUB_TOKEN PR creation" --body "This is by an automated agent, not a human.
+
+Temporary permission probe; this PR is closed immediately." 2>&1)
+          rc=$?
+          set -e
+          echo "gh-pr-create-exit=$rc"
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then
+            url=$(printf '%s\n' "$out" | tail -n 1)
+            gh pr close "$url" --repo "$GITHUB_REPOSITORY" --delete-branch
+            echo "PROBE_RESULT=can-create-pr"
+          else
+            git push origin --delete "$branch" || true
+            echo "PROBE_RESULT=cannot-create-pr"
+            exit 1
+          fi
