@@ -1,0 +1,109 @@
+name: Upstream Metasploit release
+
+on:
+  schedule:
+    # Daily at 05:17 UTC.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: upstream-metasploit-release
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: Track rapid7/metasploit-framework tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open a bump PR when upstream moves
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          latest=$(
+            git ls-remote --tags --refs https://github.com/rapid7/metasploit-framework.git \
+              | awk -F/ '{ print $NF }' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1
+          )
+          current=$(sed -n 's/^METASPLOIT_VERSION=//p' upstream.env | tail -n 1)
+
+          if [ -z "$latest" ]; then
+            echo "::error::Unable to determine the latest rapid7/metasploit-framework tag"
+            exit 1
+          fi
+
+          echo "Pinned in upstream.env: $current"
+          echo "Latest upstream tag: $latest"
+
+          if [ "$current" = "$latest" ]; then
+            echo "upstream.env already pins Metasploit Framework $latest; nothing to do"
+            exit 0
+          fi
+
+          branch="upstream/metasploit-$latest"
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "Branch $branch already exists; nothing to do"
+            exit 0
+          fi
+
+          existing_pr=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$branch" \
+            --state all \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$existing_pr" ]; then
+            echo "PR #$existing_pr already tracks $branch; nothing to do"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          sed -i "s/^METASPLOIT_VERSION=.*/METASPLOIT_VERSION=$latest/" upstream.env
+          git add upstream.env
+          git commit -m "chore(upstream): 📦 bump Metasploit Framework to $latest" \
+            -m "Advance the pinned Metasploit Framework release used by the live RPC integration job. CI runs the suite against this image."
+          git push origin "$branch"
+
+          body=$(printf '%s\n' \
+            "This is by an automated agent, not a human." \
+            "" \
+            "Updates \`upstream.env\` from Metasploit Framework \`$current\` to \`$latest\`." \
+            "" \
+            "CI starts the pinned \`metasploitframework/metasploit-framework:$latest\` image and runs the live RPC integration suite against it." \
+            "" \
+            "@dshsuperagent1 if CI fails, please fix the compatibility issue before merging.")
+
+          if ! pr_out=$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base master \
+            --head "$branch" \
+            --title "chore(upstream): 📦 bump Metasploit Framework to $latest" \
+            --body "$body" 2>&1); then
+            printf '%s\n' "$pr_out"
+            # Do not leave a stale bump branch that would make later runs skip
+            # this tag after the failure is corrected.
+            if [ -z "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state all --json number --jq '.[0].number // empty')" ]; then
+              git push origin --delete "$branch" || true
+            fi
+            echo "::error::Could not open the bump PR. If GitHub Actions is not permitted to create pull requests, enable 'Allow GitHub Actions to create and approve pull requests' under Settings > Actions > General."
+            exit 1
+          fi
+          echo "Opened bump PR: $pr_out"
+
+          # Pull requests opened with GITHUB_TOKEN do not trigger
+          # pull_request workflows, so start CI explicitly on the bump branch.
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"

@@ -1,14 +1,21 @@
 name: CI
+
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: Unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -18,3 +25,34 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race ./...
+
+  integration:
+    name: Live Metasploit RPC integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start pinned Metasploit Framework and PostgreSQL
+        run: |
+          set -euo pipefail
+          docker compose --env-file upstream.env -f .github/msf/compose.yaml up -d --wait --wait-timeout 600
+
+      - name: Run tests against live Metasploit RPC
+        env:
+          RUN_MSF_INTEGRATION: "1"
+          MSF_SSL: "false"
+          MSF_PASSWORD: testpass123
+          GOMSF_TEST_CONTAINER: gomsf-test
+        run: go test -race ./...
+
+      - name: Show Metasploit Framework logs
+        if: failure()
+        run: docker compose --env-file upstream.env -f .github/msf/compose.yaml logs --no-color --tail=300
+
+      - name: Stop Metasploit Framework and PostgreSQL
+        if: always()
+        run: docker compose --env-file upstream.env -f .github/msf/compose.yaml down -v --remove-orphans
