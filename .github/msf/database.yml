@@ -1,0 +1,18 @@
+# Database configuration mounted into the pinned Metasploit Framework image
+# for the live RPC integration tests. It matches the `db` service in
+# compose.yaml; the CI database uses trust authentication and holds no
+# persistent data.
+development: &pgsql
+  adapter: postgresql
+  host: db
+  port: 5432
+  database: msf
+  username: msf
+  pool: 100
+  timeout: 5
+
+production:
+  <<: *pgsql
+
+test:
+  <<: *pgsql

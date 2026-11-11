@@ -1,0 +1,62 @@
+# Local CI stack for the live Metasploit RPC integration tests.
+#
+# The Metasploit image is pinned by METASPLOIT_VERSION in upstream.env:
+#
+#   docker compose --env-file upstream.env -f .github/msf/compose.yaml up -d --wait
+#
+# The msf service applies the framework database migrations, then starts
+# msfrpcd with SSL disabled on the default RPC port. The container is named
+# gomsf-test because integration_test.go uses GOMSF_TEST_CONTAINER to run
+# msfvenom and reverse shells inside the same container as msfrpcd.
+name: gomsf-ci
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: gomsf-db
+    environment:
+      POSTGRES_USER: msf
+      POSTGRES_DB: msf
+      # Throwaway CI database on an isolated Docker network.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msf -d msf"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  msf:
+    image: metasploitframework/metasploit-framework:${METASPLOIT_VERSION:?METASPLOIT_VERSION must be set, see upstream.env}
+    container_name: gomsf-test
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      RAILS_ENV: production
+      # Throwaway key for the CI-only framework process; Rails 8 refuses to
+      # boot in production without one.
+      SECRET_KEY_BASE: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      # Run as root so the framework can write db/schema.rb during migration.
+      MSF_UID: "0"
+      MSF_GID: "0"
+      MSF_PASSWORD: ${MSF_PASSWORD:-testpass123}
+      # The image does not put the framework root on PATH; integration_test.go
+      # invokes msfvenom through `docker exec gomsf-test`.
+      PATH: /usr/src/metasploit-framework:/usr/local/bundle/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      - ./database.yml:/usr/src/metasploit-framework/config/database.yml:ro
+    ports:
+      - "55553:55553"
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        bundle exec rake db:migrate
+        exec ./msfrpcd -P "$${MSF_PASSWORD}" -S -a 0.0.0.0 -p 55553 -f
+    healthcheck:
+      test: ["CMD", "ruby", "-rsocket", "-e", "TCPSocket.new('127.0.0.1', 55553).close"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
