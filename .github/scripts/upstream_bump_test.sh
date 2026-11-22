@@ -117,6 +117,10 @@ assert_equal "commit author email is the GitHub noreply address" \
   "$(git -C "$repo" log -1 --format=%ae upstream/metasploit-6.5.11)"
 assert_contains "pull request targets master from the bump branch" \
   "--base master --head upstream/metasploit-6.5.11" "$(cat "$tmp_root/gh-opened.log")"
+assert_contains "pull request body names the agent that maintains the pin" \
+  "@dshsuperagent1 check the suite against 6.5.11" "$(cat "$tmp_root/gh-opened.log")"
+assert_contains "the agent is asked on the opened pull request" \
+  "pr comment https://github.com/example/go-msf/pull/99" "$(cat "$tmp_root/gh-opened.log")"
 assert_contains "step output reports the change" "changed=true" "$(cat "$repo/output")"
 assert_contains "step output reports the version" "upstream=6.5.11" "$(cat "$repo/output")"
 
