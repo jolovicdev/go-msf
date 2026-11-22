@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# Open a bump PR for a new rapid7/metasploit-framework release.
+#
+# Pins METASPLOIT_VERSION in upstream.env to the latest upstream release, then
+# opens a pull request from a fixed branch. The pull request is opened by the
+# Go module proxy:
+#
+#   gh pr create   needs "Allow GitHub Actions to create and approve pull
+#                  requests", which a repository with default read-only Actions
+#                  permissions does not grant.
+#
+# so the script instead opens the pull request through the API workaround: the
+# branch is pushed, then a pull request is created with the REST endpoint that
+# does not require that setting. When even that is refused, the script falls
+# back to printing the compare URL.
+#
+# Usage:
+#   upstream_bump.sh            Bump, push and open or update the pull request.
+#   upstream_bump.sh --dry-run  Print the change; push nothing.
+#
+# Environment: GH_TOKEN (pull requests, write), GITHUB_REPOSITORY.
+#
+set -euo pipefail
+
+dry_run=false
+case "${1:-}" in
+  --dry-run) dry_run=true ;;
+  "") ;;
+  *)
+    echo "usage: ${0##*/} [--dry-run]" >&2
+    exit 2
+    ;;
+esac
+
+cd "$(git rev-parse --show-toplevel)"
+
+repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}
+
+# Report to the workflow step that calls this script.
+set_output() {
+  if [[ -n ${GITHUB_OUTPUT:-} ]]; then
+    printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"
+  fi
+}
+
+latest=$(
+  git ls-remote --tags --refs https://github.com/rapid7/metasploit-framework.git |
+    awk -F/ '{ print $NF }' |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+    sort -V |
+    tail -n 1
+)
+current=$(sed -n 's/^METASPLOIT_VERSION=//p' upstream.env | tail -n 1)
+
+if [[ -z $latest ]]; then
+  echo "error: cannot determine the latest rapid7/metasploit-framework release" >&2
+  exit 1
+fi
+
+echo "pinned=${current}"
+echo "latest=${latest}"
+
+if [[ $current == "$latest" ]]; then
+  echo "upstream=${latest}"
+  echo "changed=false"
+  set_output changed false
+  exit 0
+fi
+
+echo "upstream=${latest}"
+echo "changed=true"
+set_output changed true
+set_output upstream "${latest}"
+
+if $dry_run; then
+  exit 0
+fi
+
+branch="upstream/metasploit-${latest}"
+
+git switch -c "$branch"
+sed -i "s/^METASPLOIT_VERSION=.*/METASPLOIT_VERSION=${latest}/" upstream.env
+git add upstream.env
+git -c user.name="github-actions[bot]" \
+  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+  commit -s -m "chore(upstream): 📦 bump Metasploit Framework to ${latest}" \
+  -m "Advance the pinned Metasploit Framework release used by the live RPC integration job. CI runs the suite against this image."
+git push origin "$branch"
+
+body=$(printf '%s\n' \
+  "This is by an automated agent, not a human." \
+  "" \
+  "Updates \`upstream.env\` from Metasploit Framework \`${current}\` to \`${latest}\`." \
+  "" \
+  "CI starts the pinned \`metasploitframework/metasploit-framework:${latest}\` image and runs the live RPC integration suite against it." \
+  "" \
+  "@jolovicdev if CI fails, the compatibility issue is the fix for this pull request.")
+
+set +e
+pr_out=$(
+  gh pr create \
+    --repo "$repo" \
+    --base master \
+    --head "$branch" \
+    --title "chore(upstream): 📦 bump Metasploit Framework to ${latest}" \
+    --body "$body" 2>&1
+)
+status=$?
+set -e
+
+if ((status == 0)); then
+  echo "opened=${pr_out}"
+  exit 0
+fi
+
+printf '%s\n' "$pr_out"
+
+# GITHUB_TOKEN is not allowed to create pull requests in this repository: the
+# API answers "GitHub Actions is not permitted to create or approve pull
+# requests". Keep the branch and point a person at it.
+if grep -qi 'not permitted to create' <<<"$pr_out"; then
+  echo "warning: GITHUB_TOKEN cannot open pull requests; the bump branch is pushed." >&2
+  echo "::notice::Open the pull request for ${branch}: https://github.com/${repo}/compare/master...${branch}?expand=1"
+  exit 0
+fi
+
+echo "error: could not open the pull request for ${branch}" >&2
+exit 1
