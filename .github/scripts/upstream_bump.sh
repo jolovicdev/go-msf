@@ -86,14 +86,24 @@ branch="upstream/metasploit-${latest}"
 author="${UPSTREAM_BUMP_AUTHOR:-jolovicdev}"
 email="${UPSTREAM_BUMP_EMAIL:-${author}@users.noreply.github.com}"
 
-git switch -c "$branch"
+# Reuse the branch when an earlier run already pushed it: it is keyed by the
+# upstream version, so it holds the same bump.
+git fetch --quiet origin "$branch" 2>/dev/null && {
+  git switch --quiet -C "$branch" FETCH_HEAD
+  echo "reusing=${branch}"
+} || git switch -c "$branch"
 sed -i "s/^METASPLOIT_VERSION=.*/METASPLOIT_VERSION=${latest}/" upstream.env
-git add upstream.env
-git -c user.name="$author" \
-  -c user.email="$email" \
-  commit -s -m "chore(upstream): 📦 bump Metasploit Framework to ${latest}" \
-  -m "Advance the pinned Metasploit Framework release used by the live RPC integration job. CI runs the suite against this image."
-git push origin "$branch"
+if git diff --quiet HEAD -- upstream.env; then
+  echo "already=${branch}"
+  git push --quiet origin "$branch"
+else
+  git add upstream.env
+  git -c user.name="$author" \
+    -c user.email="$email" \
+    commit -s -m "chore(upstream): 📦 bump Metasploit Framework to ${latest}" \
+    -m "Advance the pinned Metasploit Framework release used by the live RPC integration job. CI runs the suite against this image."
+  git push origin "$branch"
+fi
 
 body=$(printf '%s\n' \
   "This is by an automated agent, not a human." \

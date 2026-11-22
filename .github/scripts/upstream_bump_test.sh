@@ -143,6 +143,15 @@ assert_contains "refused pull request links the compare view" \
 assert_equal "refused pull request keeps the branch" "1" \
   "$(git -C "$tmp_root/refused-origin.git" rev-list --count master..upstream/metasploit-6.5.11)"
 
+# a rerun on the same commit reuses the branch an earlier run pushed
+repo=$(new_repo reused 6.5.9)
+run "$repo" "$tmp_root/gh-first.log" >/dev/null
+git -C "$repo" reset -q --hard master
+out=$(run "$repo" "$tmp_root/gh-reused.log")
+assert_contains "a rerun reuses the pushed branch" "reusing=upstream/metasploit-6.5.11" "$out"
+assert_equal "a rerun still has one commit" "1" \
+  "$(git -C "$tmp_root/reused-origin.git" rev-list --count master..upstream/metasploit-6.5.11)"
+
 printf '\n%d passed, %d failed\n' "$passes" "$failures"
 if ((failures > 0)); then
   exit 1
