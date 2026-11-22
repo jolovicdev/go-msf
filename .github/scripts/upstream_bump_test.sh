@@ -110,6 +110,11 @@ assert_equal "one commit is pushed to the bump branch" "1" \
   "$(git -C "$tmp_root/opened-origin.git" rev-list --count master..upstream/metasploit-6.5.11)"
 assert_equal "commit subject" "chore(upstream): 📦 bump Metasploit Framework to 6.5.11" \
   "$(git -C "$repo" log -1 --format=%s upstream/metasploit-6.5.11)"
+assert_equal "commit author" "jolovicdev" \
+  "$(git -C "$repo" log -1 --format=%an upstream/metasploit-6.5.11)"
+assert_equal "commit author email is the GitHub noreply address" \
+  "jolovicdev@users.noreply.github.com" \
+  "$(git -C "$repo" log -1 --format=%ae upstream/metasploit-6.5.11)"
 assert_contains "pull request targets master from the bump branch" \
   "--base master --head upstream/metasploit-6.5.11" "$(cat "$tmp_root/gh-opened.log")"
 assert_contains "step output reports the change" "changed=true" "$(cat "$repo/output")"

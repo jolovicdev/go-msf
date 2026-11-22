@@ -19,7 +19,9 @@
 #   upstream_bump.sh            Bump, push and open or update the pull request.
 #   upstream_bump.sh --dry-run  Print the change; push nothing.
 #
-# Environment: GH_TOKEN (pull requests, write), GITHUB_REPOSITORY.
+# Environment: GH_TOKEN (pull requests, write), GITHUB_REPOSITORY, and
+# optionally UPSTREAM_BUMP_AUTHOR / UPSTREAM_BUMP_EMAIL (default: jolovicdev and
+# their GitHub noreply address).
 #
 set -euo pipefail
 
@@ -79,11 +81,16 @@ fi
 
 branch="upstream/metasploit-${latest}"
 
+# The maintainer opens the pull request, so the commit and its merge carry the
+# maintainer's identity and the GitHub noreply address rather than the Actions bot.
+author="${UPSTREAM_BUMP_AUTHOR:-jolovicdev}"
+email="${UPSTREAM_BUMP_EMAIL:-${author}@users.noreply.github.com}"
+
 git switch -c "$branch"
 sed -i "s/^METASPLOIT_VERSION=.*/METASPLOIT_VERSION=${latest}/" upstream.env
 git add upstream.env
-git -c user.name="github-actions[bot]" \
-  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+git -c user.name="$author" \
+  -c user.email="$email" \
   commit -s -m "chore(upstream): 📦 bump Metasploit Framework to ${latest}" \
   -m "Advance the pinned Metasploit Framework release used by the live RPC integration job. CI runs the suite against this image."
 git push origin "$branch"
