@@ -27,6 +27,8 @@ jobs:
       - run: go test -race ./...
       - name: Release tooling tests
         run: bash .github/scripts/release_test.sh
+      - name: Upstream bump tooling tests
+        run: bash .github/scripts/upstream_bump_test.sh
 
   integration:
     name: Live Metasploit RPC integration
